@@ -29,9 +29,13 @@ function connectionHints(message) {
   return [];
 }
 
+// Logged by ServiceNow's own SAML script when SNC.SSOUtils.generateRequestId() returns nothing. That call reads
+// the HTTP session of the request (verified on a Brazil instance), so it is about the REQUEST, not the answer.
+const NO_SESSION = /request id is empty/i;
 const SAML = [
   [/Unable to locate the SAML 2\.0 Certificate/i, 'ServiceNow could not find the certificate of the temporary identity provider. This app links it through the idp_certificate table; if that table is missing on this release, Mock SSO cannot work here.'],
-  [/InResponseTo|request id/i, 'ServiceNow did not recognise the sign-in answer as belonging to its own request. This happens when the browser loses its ServiceNow session cookie between the two redirects.'],
+  [/InResponseTo/i, 'ServiceNow did not recognise the sign-in answer as belonging to its own request. This happens when the browser loses its ServiceNow session cookie between the two redirects.'],
+  [NO_SESSION, 'ServiceNow failed while building a sign-in request, because that request had no browser session on the instance. The identity provider of this app did answer during this run, so this log line may belong to another visitor: the system log is shared by everyone on the instance.'],
   [/audience/i, 'The audience in the sign-in answer does not match the instance. Check that the Instance URL under ServiceNow > Connection is exactly the address users open, with no alias or trailing path.'],
   [/NotBefore|NotOnOrAfter|expired|clock/i, 'The clocks of this machine and the instance disagree by more than the allowed skew. Correct this machine\'s clock (NTP).'],
   [/signature|digest/i, 'ServiceNow rejected the signature of the sign-in answer.'],
@@ -44,7 +48,7 @@ async function diagnose(sn, run) {
   const mins = Math.ceil((Date.now() - run.createdAt) / 60000) + 2;
   const since = `sys_created_on>=javascript:gs.minutesAgoStart(${mins})`;
   const out = [];
-  const add = (title, detail, evidence) => { if (!out.some((o) => o.title === title)) out.push({ title, detail, evidence: (evidence || []).slice(0, 4) }); };
+  const add = (title, detail, evidence) => { if (!out.some((o) => o.title === title)) out.push({ title, detail, evidence: (evidence || []).slice(0, 6) }); };
   const q = (table, query, fields, limit = 20, opts) => sn.query(table, query, fields, limit, opts).catch(() => []);
   const errors = [...(run.steps || []).map((s) => s.lastError || ''), ...(run.shots || []).map((s) => s.error || ''), ...(run.trace || []).map((s) => s.error || '')].filter(Boolean);
   const seen = (re) => errors.some((e) => re.test(e));
@@ -54,8 +58,36 @@ async function diagnose(sn, run) {
   if (sc.authMode === 'sso') {
     const logs = await q('syslog', `${since}^source=SAML2^level>=2`, 'message', 12);
     const texts = [...new Set(logs.map((l) => String(l.message).replace(/\s+/g, ' ').slice(0, 220)))];
-    for (const [re, advice] of SAML) if (texts.some((t) => re.test(t))) add('ServiceNow rejected the single sign-on answer', advice, texts.filter((t) => re.test(t)));
-    if (texts.length && !out.length) add('ServiceNow rejected the single sign-on answer', 'The instance logged the reason below (System Log, source SAML2).', texts);
+    // What this app saw itself: where the browser was sent, what it holds, and whether the identity provider was ever asked.
+    const failed = (run.steps || []).find((s) => s.errors && s.lastPath);
+    const path = failed ? failed.lastPath : [];
+    const cookies = failed ? failed.lastCookies : null;
+    const asked = run.idpStats || { issued: 0, refused: 0 };
+    const facts = [];
+    if (path.length) facts.push(`The browser was sent: ${path.join('  ->  ')}`);
+    if (cookies) facts.push(cookies.length ? `Cookies the browser holds for the instance: ${cookies.join(', ')}` : 'The browser holds no cookie for the instance at all.');
+    facts.push(`This app's identity provider answered ${asked.issued} sign-in request(s) and refused ${asked.refused}.`);
+    const sentToIdp = path.some((p) => /\/idp\/sso$/.test(p));
+    const noSession = texts.filter((t) => NO_SESSION.test(t));
+    if (run.idpStats && !asked.issued && !asked.refused) {
+      if (noSession.length && !sentToIdp) {
+        const held = cookies && !cookies.some((c) => /JSESSIONID/i.test(c))
+          ? 'The browser holds no JSESSIONID cookie (see below): the instance, or a proxy or gateway in front of it, did not give this browser a session.'
+          : 'Whether the browser holds a session cookie is listed below; if it does, the session was not there, or not used, on the request that started the sign-in.';
+        add('ServiceNow could not start the single sign-on',
+          `ServiceNow failed while building its sign-in request, before sending the browser anywhere. Its log says the request id is empty: ServiceNow takes that id from the browser session of the request, so the request that asked for single sign-on had no session on the instance. ${held} Try the same test with "Sign in first" instead of arriving through the link, and without the proxy if the instance can be reached directly: the path below shows which change makes the difference.`,
+          [...facts, noSession[0]]);
+      } else if (sentToIdp) {
+        add('The browser was sent to the test identity provider but did not get an answer', 'ServiceNow sent the browser to this app, and the request never arrived here. The browser cannot open that address: check the address of this app the browsers use (Capacity and workers), and that the proxy is not used for it.', facts);
+      } else {
+        add('ServiceNow never sent the browser to the test identity provider', 'The sign-in did not get as far as this app. Either ServiceNow sent the browser to another identity provider (see the path below: an instance that sends everyone to its company sign-on page first), or it stopped before sending it anywhere.', [...facts, ...texts.slice(0, 2)]);
+      }
+    } else if (run.idpStats && asked.refused && !asked.issued) {
+      add('The test identity provider refused the browser', 'The browser reached this app without the ticket of a test user. This happens when the browsers reach this app under another address than the one the ticket was made for.', facts);
+    } else {
+      for (const [re, advice] of SAML) if (texts.some((t) => re.test(t))) add('ServiceNow rejected the single sign-on answer', advice, [...texts.filter((t) => re.test(t)).slice(0, 3), ...facts]);
+      if (texts.length && !out.length) add('ServiceNow rejected the single sign-on answer', 'The instance logged the reason below (System Log, source SAML2).', [...texts.slice(0, 3), ...facts]);
+    }
   }
 
   // 2. A sign-in the page calls "invalid" is often a policy refusal: the event log tells the truth.

@@ -525,7 +525,10 @@ function pageAccount() {
 // ---- clicks that work on every page -----------------------------------------------
 document.body.addEventListener('click', guard(async (e) => {
   const t = e.target;
-  const d = t.dataset || {};
+  // A click lands on whatever is under the pointer - the title or the text INSIDE a button - so look for the
+  // nearest element that carries an action, not only at the element that was hit.
+  const actor = (t.closest && t.closest('[data-choice],[data-add],[data-del],[data-up],[data-down]')) || t;
+  const d = actor.dataset || {};
   const shot = t.closest && t.closest('.shot');
   const go = t.closest && t.closest('[data-go]');
   if (shot) { $('lightbox').querySelector('img').src = shot.dataset.shot; $('lightbox').querySelector('p').textContent = shot.dataset.cap; $('lightbox').classList.remove('hidden'); return; }

@@ -403,7 +403,7 @@ class Controller {
     if (!s.ok) r.totals.errors += 1;
     const step = r.steps.find((x) => x.index === s.step);
     if (step) {
-      step.n += 1; if (!s.ok) { step.errors += 1; step.lastError = s.error; }
+      step.n += 1; if (!s.ok) { step.errors += 1; step.lastError = s.error; if (Array.isArray(s.path)) { step.lastPath = s.path.slice(0, 14).map((p) => String(p).slice(0, 160)); step.lastCookies = Array.isArray(s.cookies) ? s.cookies.slice(0, 14).map((c) => String(c).slice(0, 60)) : null; } }
       step.ms.push(ms);
       if (step.n % 5 === 0 || step.n < 20) Object.assign(step, summary(step.ms));
     }

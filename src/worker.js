@@ -48,7 +48,7 @@ function cpuPercent() {
 // the content is fetched. A step ends when no request has been in flight for
 // `quietMs` (long-lived channels such as /amb are not counted).
 function watch(page) {
-  const w = { inflight: new Map(), lastChange: Date.now(), serverErrors: 0, requests: 0 };
+  const w = { inflight: new Map(), lastChange: Date.now(), serverErrors: 0, requests: 0, path: [] };
   const skip = (r) => LONG_LIVED.test(r.url()) || ['websocket', 'eventsource'].includes(r.resourceType());
   page.on('request', (r) => { if (skip(r)) return; w.inflight.set(r, 0); w.requests += 1; w.lastChange = Date.now(); });
   const done = (r) => { if (w.inflight.delete(r)) w.lastChange = Date.now(); };
@@ -56,6 +56,11 @@ function watch(page) {
   page.on('requestfailed', done);
   page.on('response', (r) => {
     if (r.status() >= 500) w.serverErrors += 1;
+    // Every document the browser itself was sent to, in order: on a failed sign-in this is the story.
+    try {
+      const q = r.request();
+      if (q.isNavigationRequest() && q.frame() === page.mainFrame() && w.path.length < 14) { const u = new URL(r.url()); w.path.push(`${r.status()} ${u.origin}${u.pathname}`); }
+    } catch { /* a request with no frame */ }
     // A streamed answer never "finishes": once the server has answered, the
     // body gets a few seconds and is then no longer waited for.
     if (w.inflight.has(r.request())) { w.inflight.set(r.request(), Date.now()); w.lastChange = Date.now(); }
@@ -112,7 +117,7 @@ class VU {
         await this.page.goto('about:blank');
         await this.ctx.clearCookies();
         if (cfg.authMode === 'sso') await this.ctx.addCookies([{ name: 'uiload_idp', value: this.spec.ticket, url: cfg.idpBaseUrl, httpOnly: true }]);
-        this.signedIn = false;
+        this.signedIn = false; this.cold = false;
         return;
       } catch { /* fall through to a new context */ }
     }
@@ -123,7 +128,7 @@ class VU {
     if (cfg.authMode === 'sso') await this.ctx.addCookies([{ name: 'uiload_idp', value: this.spec.ticket, url: cfg.idpBaseUrl, httpOnly: true }]);
     this.page = await within(this.ctx.newPage(), 30000, 'opening a browser tab');
     this.w = watch(this.page);
-    this.signedIn = false;
+    this.signedIn = false; this.cold = true;
   }
 
   // Runs `fn`, waits for the page to settle, and reports one sample.
@@ -132,7 +137,7 @@ class VU {
     const w = this.w;
     const t0 = Date.now();
     const s = { vu: this.spec.id, step: index, name, ok: true, t: t0, status: 0, error: '' };
-    w.serverErrors = 0; w.requests = 0; w.lastChange = t0;
+    w.serverErrors = 0; w.requests = 0; w.lastChange = t0; w.path = [];
     this.at = name; this.since = t0;
     try {
       const status = await fn(t0 + cfg.timeoutMs);
@@ -152,6 +157,10 @@ class VU {
     s.serverErrors = w.serverErrors; s.requests = w.requests;
     this.last = { ok: s.ok, ms: s.ms };
     try { s.url = this.page.url(); } catch { s.url = ''; }
+    if (!s.ok) {
+      s.path = w.path.slice();
+      try { s.cookies = (await within(this.ctx.cookies(cfg.origin), 4000, 'reading the cookies')).map((c) => c.name).slice(0, 14); } catch { /* the window is gone */ }
+    }
     out.samples.push(s);
     const wantShot = shot === 'all' || (!s.ok && this.run.errorShots < cfg.maxErrorShots);
     if (wantShot) {
@@ -237,9 +246,11 @@ class VU {
       let status = 0;
       if (st.type === 'open') {
         let url = /^https?:\/\//i.test(st.url) ? st.url : cfg.origin + (st.url.startsWith('/') ? '' : '/') + st.url;
-        if (viaLink) url += `${url.includes('?') ? '&' : '?'}glide_sso_id=${cfg.ssoId}`;
-        const r = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: cfg.timeoutMs });
-        status = r ? r.status() : 0;
+        if (viaLink && cfg.authMode === 'sso') status = await this.arriveBySso(url, deadline);
+        else {
+          const r = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: cfg.timeoutMs });
+          status = r ? r.status() : 0;
+        }
       } else if (st.type === 'click') {
         await (await inAnyFrame(page, st.selector, deadline)).click({ timeout: cfg.timeoutMs });
         await sleep(100);
@@ -253,6 +264,92 @@ class VU {
       return status;
     }, { shot });
     if (viaLink) this.signedIn = s.ok;
+  }
+
+  // Arriving through a link with no session, as a person does from an e-mail.
+  // ServiceNow sends such a browser to an identity provider. On an instance that
+  // already has single sign-on, that is the company's own sign-on page, whatever
+  // the link says - and a test user does not exist there. So the moment the
+  // browser is sent anywhere outside the instance, it is taken to the test
+  // identity provider instead (login_with_sso.do with the run's provider). The
+  // company's sign-on page is never opened, and only test browsers are affected:
+  // nothing is changed on the instance.
+  async arriveBySso(target, deadline) {
+    const cfg = this.run.cfg;
+    const page = this.page;
+    const sso = `${cfg.origin}/login_with_sso.do?glide_sso_id=${cfg.ssoId}`;
+    let idpOrigin = '';
+    try { idpOrigin = new URL(cfg.idpBaseUrl).origin; } catch { /* none */ }
+    const foreign = (u) => { try { const o = new URL(String(u)).origin; return /^https?:/.test(o) && o !== cfg.origin && o !== idpOrigin; } catch { return false; } };
+    let diverted = 0;
+    const match = (u) => foreign(u.href);
+    const divert = async (route) => {
+      const q = route.request();
+      let top = false;
+      try { top = q.isNavigationRequest() && q.frame() === page.mainFrame(); } catch { /* no frame */ }
+      if (!top || diverted >= 2) return route.continue();
+      diverted += 1;
+      if (!this.run.divertedFrom) {
+        this.run.divertedFrom = new URL(q.url()).origin;
+        out.log.push(`This instance sends arriving browsers to its own sign-on page (${this.run.divertedFrom}). Test browsers are taken to the test identity provider instead; that page is never opened.`);
+      }
+      return route.fulfill({ status: 302, headers: { location: sso }, body: '' });
+    };
+    // Watching navigations switches the browser cache off while it lasts. A new
+    // window has no cache to lose; a returning one is watched only on an
+    // instance that has been seen to send browsers elsewhere.
+    const guard = this.cold || !!this.run.divertedFrom;
+    if (guard) await page.route(match, divert);
+    let visited = false;                 // has this browser been to the test identity provider?
+    const seen = (f) => { try { if (f === page.mainFrame() && new URL(f.url()).origin === idpOrigin) visited = true; } catch { /* no url */ } };
+    page.on('framenavigated', seen);
+    try {
+      const withId = `${target}${target.includes('?') ? '&' : '?'}glide_sso_id=${cfg.ssoId}`;
+      let r = await page.goto(withId, { waitUntil: 'domcontentloaded', timeout: cfg.timeoutMs });
+      if (!guard && foreign(page.url())) {
+        // First seen on a returning browser: sign in at the test provider, then open the link.
+        this.run.divertedFrom = new URL(page.url()).origin;
+        out.log.push(`This instance sends arriving browsers to its own sign-on page (${this.run.divertedFrom}). Test browsers are taken to the test identity provider instead.`);
+        await page.goto(sso, { waitUntil: 'domcontentloaded', timeout: cfg.timeoutMs });
+        diverted = 1;
+      }
+      const want = new URL(target);
+      const there = () => { try { const u = new URL(page.url()); return u.origin === cfg.origin && u.pathname === want.pathname && [...want.searchParams].every(([k, v]) => u.searchParams.get(k) === v); } catch { return false; } };
+      // On the instance, and not on one of the pages a sign-in only passes through.
+      const home = () => { try { const u = new URL(page.url()); return u.origin === cfg.origin && !/\/(navpage|login_with_sso|auth_redirect|login_redirect)\.do$/i.test(u.pathname); } catch { return false; } };
+      let still = 0; let last = '';
+      if (!diverted) {
+        // Some links start no sign-in at all: a portal page open to guests, or
+        // the login page. If the browser rests on the instance without having
+        // been to the test identity provider, take it there.
+        while (Date.now() < deadline && !visited) {
+          const now = page.url();
+          still = now === last && home() ? still + 1 : 0; last = now;
+          if (still >= 8) break;
+          await sleep(150);
+        }
+        if (!visited && home()) {
+          if (!this.run.noSsoNote) { this.run.noSsoNote = true; out.log.push(`ServiceNow did not start a sign-in for this link (the browser stayed on ${new URL(page.url()).pathname}). Test browsers sign in at the test identity provider and then open the link.`); }
+          await page.goto(sso, { waitUntil: 'domcontentloaded', timeout: cfg.timeoutMs });
+          diverted = 1;
+        }
+        still = 0; last = '';
+      }
+      if (diverted) {
+        // The sign-in ends back on the instance. If ServiceNow did not keep the link, open it now.
+        while (Date.now() < deadline && !there()) {
+          const now = page.url();
+          still = now === last && home() ? still + 1 : 0; last = now;
+          if (still >= 8) break;                       // on the instance, 1.2 s on the same page that is not the link
+          await sleep(150);
+        }
+        if (!there() && home()) r = await page.goto(target, { waitUntil: 'domcontentloaded', timeout: cfg.timeoutMs });
+      }
+      return r ? r.status() : 0;
+    } finally {
+      page.off('framenavigated', seen);
+      if (guard) await page.unroute(match, divert).catch(() => {});
+    }
   }
 
   async pause(ms) {

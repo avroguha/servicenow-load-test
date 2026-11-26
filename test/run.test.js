@@ -180,3 +180,50 @@ test('a one-user test gives up after its steps\' time limits, not after ten minu
   for (let i = 0; i < 400 && r.state !== 'failed'; i += 1) await settle();
   assert.strictEqual(r.state, 'failed'); assert.match(r.error, /did not finish within 4 minutes/);
 });
+
+// ---- a failed single sign-on is explained from what the app saw itself ------
+test('"request id is empty" is about ServiceNow building its request, and the answer shows the browser\'s path and cookies', async () => {
+  const { diagnose } = require('../src/diagnose');
+  const sn = { query: async (table) => (table === 'syslog' ? [{ message: 'SAML2Error: Failed generating request id: request id is empty' }] : []) };
+  const base = { createdAt: Date.now(), scenario: normalize({ name: 'T', authMode: 'sso', users: { prefix: 'lt.' }, steps: [{ type: 'open', url: '/kb' }] }), shots: [], trace: [] };
+  let out = await diagnose(sn, { ...base, idpStats: { issued: 0, refused: 0 }, steps: [{ errors: 1, lastError: 'not signed in (landed on /login_with_sso.do)', lastPath: ['200 https://x.example/kb_view.do'], lastCookies: ['glide_user_route'] }] });
+  assert.strictEqual(out[0].title, 'ServiceNow could not start the single sign-on');
+  assert.match(out[0].detail, /no JSESSIONID cookie/);
+  assert.ok(!/session cookie between the two redirects/.test(out[0].detail), 'the old, wrong explanation');
+  assert.ok(out[0].evidence.some((e) => /The browser was sent: 200 https:\/\/x\.example\/kb_view\.do/.test(e)));
+  assert.ok(out[0].evidence.some((e) => /answered 0 sign-in request/.test(e)));
+  // The identity provider did answer: the same log line is then probably somebody else's.
+  out = await diagnose(sn, { ...base, idpStats: { issued: 1, refused: 0 }, steps: [{ errors: 1, lastError: 'not signed in', lastPath: [], lastCookies: [] }] });
+  assert.match(out[0].detail, /may belong to another visitor/);
+});
+
+test('a failed step carries the browser\'s path and cookie names to the run', () => {
+  const { c, r } = liveRun();
+  c.sample(r, { step: 0, ok: false, ms: 5, error: 'x', path: ['302 https://a/b'], cookies: ['JSESSIONID'] });
+  assert.deepStrictEqual([r.steps[0].lastPath, r.steps[0].lastCookies], [['302 https://a/b'], ['JSESSIONID']]);
+  assert.match(fs.readFileSync(path.join(root, 'src', 'worker.js'), 'utf8'), /isNavigationRequest\(\) && q\.frame\(\) === page\.mainFrame\(\)/);
+});
+
+// ---- an instance that already has single sign-on --------------------------
+test('a test browser arriving through a link is taken to the test identity provider, never to the company sign-on page', () => {
+  const w = fs.readFileSync(path.join(root, 'src', 'worker.js'), 'utf8');
+  const fn = w.slice(w.indexOf('async arriveBySso('), w.indexOf('async pause('));
+  assert.ok(fn.length > 500, 'arriveBySso is missing');
+  // Any top-level navigation leaving the instance (other than to this app) is answered with a redirect to the run's own provider.
+  assert.match(fn, /route\.fulfill\(\{ status: 302, headers: \{ location: sso \}/);
+  assert.match(fn, /login_with_sso\.do\?glide_sso_id=\$\{cfg\.ssoId\}/);
+  assert.match(fn, /o !== cfg\.origin && o !== idpOrigin/);
+  // A link that starts no sign-in at all (a guest page) is handled too, and the link is opened again if ServiceNow did not keep it.
+  assert.match(fn, /if \(!visited && home\(\)\)/);
+  assert.match(fn, /if \(!there\(\) && home\(\)\) r = await page\.goto\(target/);
+  // Watching navigations switches the cache off, so it is always removed again.
+  assert.match(fn, /finally \{[\s\S]*page\.unroute\(match, divert\)/);
+  assert.match(w, /if \(viaLink && cfg\.authMode === 'sso'\) status = await this\.arriveBySso\(url, deadline\)/);
+});
+
+test('a click on the text inside a card or button still selects it', () => {
+  // The choice cards hold a title and a line of text; a person clicks those, not the card's edge.
+  const ui = fs.readFileSync(path.join(root, 'public', 'app.js'), 'utf8');
+  assert.match(ui, /t\.closest\('\[data-choice\],\[data-add\],\[data-del\],\[data-up\],\[data-down\]'\)/);
+  assert.match(ui, /const d = actor\.dataset/);
+});
