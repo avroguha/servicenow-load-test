@@ -19,6 +19,7 @@ function fakeSN(seed = {}) {
     base: 'https://x.example', userName: 'admin', tables, deleted: [],
     async query(t, q) { return tables[t].filter((r) => match(r, q || '')); },
     async insert(t, body) { n += 1; const row = { sys_id: `id${n}`, ...body }; tables[t].push(row); return row; },
+    async patch(t, id, body) { const row = tables[t].find((r) => r.sys_id === id); if (!row) throw Object.assign(new Error('HTTP 404'), { status: 404 }); Object.assign(row, body); return row; },
     async remove(t, id) { const i = tables[t].findIndex((r) => r.sys_id === id); if (i < 0) return false; tables[t].splice(i, 1); this.deleted.push(`${t}:${id}`); return true; },
   };
 }
@@ -142,4 +143,67 @@ test('API test with OAuth: a temporary client is created and removed with its to
   assert.ok(res.complete, JSON.stringify(res));
   assert.strictEqual(sn.tables.oauth_entity.length, 0);
   assert.deepStrictEqual(sn.tables.oauth_credential.map((t) => t.sys_id), ['tok2'], 'only this client\'s tokens go');
+});
+
+// ---- an instance that refuses the identity provider record -------------------
+const idpFields = () => ({
+  core: { name: 'UI load test [run r9] identity provider', idp: 'urn:uiload:r9', idp_authnrequest_url: 'http://127.0.0.1:8787/idp/sso', service_url: 'https://x.example/navpage.do', issuer: 'https://x.example', audience: 'https://x.example', nameid_policy: 'unspecified' },
+  needed: { user_field: 'user_name', x509_certificate: 'cert1', sso_script: 'si' },
+  safe: { default: 'false', is_primary: 'false', show_as_login_option: 'false', auto_provision: 'false', auto_update_user: 'false' },
+  extra: { is_test_connection_successful: 'true', createrequestedauthncontext: 'false' },
+});
+const refusal = () => Object.assign(new Error('POST /api/now/table/saml2_update1_properties: HTTP 403 Operation Failed - Error during insert of saml2_update1_properties (x)'), { status: 403 });
+// refuse(body, how) -> true to refuse that write
+function pickySN(refuse, seedOver = {}) {
+  const sn = fakeSN({ ...seed(), syslog: [], ...seedOver });
+  const insert = sn.insert.bind(sn); const patch = sn.patch.bind(sn);
+  sn.insert = async (t, body, o) => { if (t === 'saml2_update1_properties' && refuse(body, 'insert')) throw refusal(); return insert(t, body, o); };
+  sn.patch = async (t, id, body) => { if (refuse(body, 'patch')) throw Object.assign(new Error('PATCH x: HTTP 403 Operation Failed'), { status: 403 }); return patch(t, id, body); };
+  return sn;
+}
+
+test('an instance that refuses the record in one step gets it built inactive, field by field, and switched on last', async () => {
+  const sn = pickySN((body, how) => how === 'insert' && body.active === 'true');
+  const ledger = []; const notes = [];
+  const rec = await prov.createIdp(sn, idpFields(), { ledger: (r) => ledger.push(r), log: (t) => notes.push(t) });
+  const row = sn.tables.saml2_update1_properties[0];
+  assert.strictEqual(row.sys_id, rec.sys_id);
+  assert.deepStrictEqual([row.active, row.x509_certificate, row.sso_script, row.default, row.auto_provision], ['true', 'cert1', 'si', 'false', 'false']);
+  assert.strictEqual(ledger.length, 1, 'the record is in the ledger from the moment it exists, so cleanup finds it whatever happens next');
+  assert.match(notes.join(' '), /field by field/);
+});
+
+test('a refusal is explained: a twin entity id, a missing role, a field, the activation', async () => {
+  const opts = { ledger() {}, log() {} };
+  // an existing record with the same entity id - the one cause ServiceNow gives this very message for
+  let sn = pickySN(() => true, { saml2_update1_properties: [{ sys_id: 'old', name: 'Company SSO', idp: 'urn:uiload:r9', active: 'true' }] });
+  await assert.rejects(prov.createIdp(sn, idpFields(), opts), /already has an identity provider record with the entity id urn:uiload:r9 \("Company SSO"\)/);
+  assert.strictEqual(sn.tables.saml2_update1_properties.length, 1, 'the existing record is not touched');
+
+  // nothing can be inserted, and the account lacks the role
+  sn = pickySN((b, how) => how === 'insert', { sys_user_has_role: [] });
+  await assert.rejects(prov.createIdp(sn, idpFields(), opts), /has neither the admin nor the sso_config_admin role/);
+
+  // a field the sign-in needs is refused: the error names it, and the half-built record is in the ledger
+  sn = pickySN((b, how) => (how === 'insert' && b.active === 'true') || (how === 'patch' && 'x509_certificate' in b));
+  const ledger = [];
+  await assert.rejects(prov.createIdp(sn, idpFields(), { ledger: (r) => ledger.push(r), log() {} }), /refuses the value "cert1" for the field x509_certificate/);
+  assert.strictEqual(ledger.length, 1);
+
+  // an optional field is refused: noted, not fatal
+  sn = pickySN((b, how) => (how === 'insert' && b.active === 'true') || (how === 'patch' && 'is_test_connection_successful' in b));
+  const notes = [];
+  await prov.createIdp(sn, idpFields(), { ledger() {}, log: (t) => notes.push(t) });
+  assert.match(notes.join(' '), /refused is_test_connection_successful = true/);
+  assert.strictEqual(sn.tables.saml2_update1_properties[0].active, 'true');
+
+  // everything accepted except switching it on
+  sn = pickySN((b, how) => (how === 'insert' && b.active === 'true') || (how === 'patch' && b.active === 'true'));
+  await assert.rejects(prov.createIdp(sn, idpFields(), opts), /refuses to activate it[\s\S]*Test Connection[\s\S]*Use local sign-in/);
+
+  // a record that will not give up being the default is never left active
+  sn = pickySN((b, how) => (how === 'insert' && b.active === 'true') || (how === 'patch' && 'default' in b));
+  const ins = sn.insert; sn.insert = async (t, body, o) => ins(t, t === 'saml2_update1_properties' ? { ...body, default: 'true' } : body, o);
+  await assert.rejects(prov.createIdp(sn, idpFields(), opts), /came out with default switched on/);
+  assert.notStrictEqual(sn.tables.saml2_update1_properties[0].active, 'true');
 });

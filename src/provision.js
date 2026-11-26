@@ -95,6 +95,76 @@ async function preflight(sn, scenario, count) {
   return out;
 }
 
+// What the instance itself logged about a refusal, when it logged anything.
+async function logged(sn, words) {
+  try {
+    const rows = await sn.query('syslog', `sys_created_on>=javascript:gs.minutesAgoStart(2)^level>=2^${words.map((w) => `messageLIKE${w}`).join('^OR')}`, 'message', 4);
+    return [...new Set(rows.map((r) => String(r.message).replace(/\s+/g, ' ').slice(0, 220)))];
+  } catch { return []; }
+}
+
+// The identity provider record. ServiceNow answers a refused insert with
+// "Error during insert" and no reason, and what it refuses differs between
+// releases and instances. So: try it in one step; if that is refused, find out
+// why - an existing record with the same entity id, a missing role - and
+// otherwise build the record inactive, field by field, so the refusal can be
+// named, and switch it on last.
+async function createIdp(sn, f, { ledger, log }) {
+  const all = { ...f.core, ...f.needed, ...f.safe, ...f.extra, active: 'true' };
+  let first;
+  try {
+    // UILOAD_IDP_STEP_BY_STEP=1 skips the one-step insert: a way to exercise the careful path on an instance that accepts both.
+    if (process.env.UILOAD_IDP_STEP_BY_STEP === '1') throw Object.assign(new Error('one-step insert skipped on request'), { status: 403 });
+    const rec = await sn.insert('saml2_update1_properties', all);
+    ledger({ table: 'saml2_update1_properties', id: rec.sys_id, label: rec.name });
+    return rec;
+  } catch (err) { first = err; }
+  if (first.status !== 403 && first.status !== 400) throw first;
+
+  // The entity id must be unique among identity provider records.
+  const twin = await sn.query('saml2_update1_properties', `idp=${f.core.idp}`, 'sys_id,name,active', 1).catch(() => []);
+  if (twin.length) throw new Error(`ServiceNow already has an identity provider record with the entity id ${f.core.idp} ("${twin[0].name}"). Entity ids must be unique. If it is left from an earlier run, remove it under ServiceNow > Records on the instance; then run again.`);
+
+  let rec;
+  try { rec = await sn.insert('saml2_update1_properties', { ...f.core, active: 'false' }); } catch (err) {
+    const mine = await sn.query('sys_user_has_role', `user.user_name=${sn.userName}^role.nameINadmin,sso_config_admin,acr_admin,security_admin`, 'role.name', 10).catch(() => []);
+    const roles = mine.map((r) => r['role.name']);
+    const said = await logged(sn, ['saml2_update1_properties', 'sso_properties']);
+    throw new Error(`ServiceNow refused to create an identity provider record, even an inactive one with only its basic fields (${err.message}). `
+      + (roles.includes('sso_config_admin') || roles.includes('admin')
+        ? `The account ${sn.userName} has the role${roles.length > 1 ? 's' : ''} ${roles.join(', ')}, which normally allows it, so a rule on this instance is stopping it. `
+        : `The account ${sn.userName} has neither the admin nor the sso_config_admin role; one of them is needed to create identity provider records. `)
+      + (said.length ? `The instance logged: ${said.join(' | ')}. ` : 'The instance logged no reason. ')
+      + 'To see the reason, open Multi-Provider SSO > Identity Providers > New > SAML as that account and save a record. Until then, tests can use local sign-in.');
+  }
+  ledger({ table: 'saml2_update1_properties', id: rec.sys_id, label: rec.name });
+  log('ServiceNow refused the identity provider record in one step; building it field by field to find what it objects to.');
+
+  const refused = [];
+  const put = async (fields, essential) => {
+    for (const [k, v] of Object.entries(fields)) {
+      try { await sn.patch('saml2_update1_properties', rec.sys_id, { [k]: v }); } catch (err) {
+        refused.push(k);
+        if (essential) throw new Error(`ServiceNow refuses the value "${v}" for the field ${k} of the identity provider record (${err.message}). The mock sign-in cannot work without it.`);
+        log(`Note: ServiceNow refused ${k} = ${v} on the identity provider record (${err.message.replace(/^PATCH \S+ /, '')}); continuing without it.`);
+      }
+    }
+  };
+  await put(f.needed, true);
+  await put(f.extra, false);
+  // The safety settings are not optional: a record that could become the default or auto-create users is not acceptable.
+  await put(f.safe, false);
+  const now = (await sn.query('saml2_update1_properties', `sys_id=${rec.sys_id}`, 'default,is_primary,show_as_login_option,auto_provision', 1))[0] || {};
+  const unsafe = ['default', 'is_primary', 'show_as_login_option', 'auto_provision'].filter((k) => String(now[k]) === 'true');
+  if (unsafe.length) throw new Error(`The identity provider record came out with ${unsafe.join(', ')} switched on and ServiceNow would not switch ${unsafe.length > 1 ? 'them' : 'it'} off. The run stops rather than leave a record that could affect other users' sign-in.`);
+  try { await sn.patch('saml2_update1_properties', rec.sys_id, { active: 'true' }); } catch (err) {
+    const said = await logged(sn, ['saml2_update1_properties', 'SAML', 'IdP']);
+    throw new Error(`ServiceNow accepted the identity provider record but refuses to activate it (${err.message}). Some instances require "Test Connection" to pass in the form before an identity provider can be active; the mock sign-in cannot do that step.${said.length ? ` The instance logged: ${said.join(' | ')}.` : ''} Use local sign-in for this test.`);
+  }
+  log(`Identity provider record built step by step${refused.length ? `; ServiceNow refused: ${refused.join(', ')}` : '; the one-step insert was refused although every field was accepted on its own'}.`);
+  return { ...rec, ...f.core };
+}
+
 // Creates what the run needs: the identity provider record (Mock SSO), the
 // OAuth client (API with OAuth) and the users. `ledger(rec)` is called for each
 // record created; `stop()` true makes it return early.
@@ -112,21 +182,23 @@ async function provision(sn, { runId, scenario, count, pre, idpBaseUrl, ledger, 
       short_description: 'Temporary. Created by the UI load test tool and deleted when the run stops.',
     });
     ledger({ table: 'sys_certificate', id: c.sys_id, label: c.name });
-    const rec = await sn.insert('saml2_update1_properties', {
-      name: `${mark} identity provider`,
-      idp: entityId,
-      idp_authnrequest_url: `${idpBaseUrl}/idp/sso`,
-      idp_logout_url: `${idpBaseUrl}/idp/logout`,
-      service_url: `${sn.base}/navpage.do`, issuer: sn.base, audience: sn.base,
-      nameid_policy: UNSPECIFIED, user_field: 'user_name',
-      x509_certificate: c.sys_id, sso_script: pre.ssoScriptId,
+    const rec = await createIdp(sn, {
+      // What ServiceNow needs to accept the record at all.
+      core: {
+        name: `${mark} identity provider`,
+        idp: entityId,
+        idp_authnrequest_url: `${idpBaseUrl}/idp/sso`,
+        idp_logout_url: `${idpBaseUrl}/idp/logout`,
+        service_url: `${sn.base}/navpage.do`, issuer: sn.base, audience: sn.base,
+        nameid_policy: UNSPECIFIED,
+      },
+      // What the sign-in cannot work without.
+      needed: { user_field: 'user_name', x509_certificate: c.sys_id, sso_script: pre.ssoScriptId },
       // Not the default, not offered on the login page, never redirected to on
       // its own: only a user whose sso_source names this record is sent here.
-      active: 'true', default: 'false', is_primary: 'false', show_as_login_option: 'false',
-      is_test_connection_successful: 'true', createrequestedauthncontext: 'false',
-      auto_provision: 'false', auto_update_user: 'false',
-    });
-    ledger({ table: 'saml2_update1_properties', id: rec.sys_id, label: rec.name });
+      safe: { default: 'false', is_primary: 'false', show_as_login_option: 'false', auto_provision: 'false', auto_update_user: 'false' },
+      extra: { is_test_connection_successful: 'true', createrequestedauthncontext: 'false' },
+    }, { ledger, log });
     // ServiceNow looks the certificate up through this link table, not the field above.
     const link = await sn.insert('idp_certificate', { idp: rec.sys_id, x509_certificate: c.sys_id });
     ledger({ table: 'idp_certificate', id: link.sys_id, label: `${mark} certificate link` });
@@ -243,4 +315,4 @@ async function cleanup(sn, { runId, ledger, log }) {
   return { deleted, failed, remaining, complete: !remaining.length && !failed.length, at: Date.now() };
 }
 
-module.exports = { preflight, provision, cleanup, userNames, marker, list, NAME_RE, BASIC_ROLE };
+module.exports = { createIdp, preflight, provision, cleanup, userNames, marker, list, NAME_RE, BASIC_ROLE };

@@ -120,3 +120,63 @@ test('several instances: the old single connection becomes the first, passwords 
   store.write('settings.json', {});
   assert.throws(() => store.instance(store.settings(), ''), /No ServiceNow instance is set up yet/);
 });
+
+// ---- a run must never sit silent, and must always end with a verdict --------
+function liveRun(over = {}) {
+  const c = new Controller({ port: 0 });
+  clearInterval(c.timer);
+  const sc = normalize({ name: 'T', users: { prefix: 'lt.' }, steps: [{ type: 'open', url: '/' }] });
+  const r = { id: 'run1', kind: 'build', scenario: sc, state: 'running', phase: '', createdAt: Date.now(), startedAt: Date.now(), log: [], ledger: [], users: [{ name: 'lt.001' }], stages: [], steps: [{ index: 0, name: 'open /', n: 0, errors: 0, ms: [] }], series: [], shots: [], trace: [], advice: [], totals: { n: 0, errors: 0, serverErrors: 0, requests: 0 }, finished: new Set(), target: 1, active: 0, elapsed: 0, plan: plan(sc), ...over };
+  c.run = r; c.persist = () => {};
+  c.sn = { query: async () => [] };
+  c.clean = async (run) => { run.cleanup = { complete: true, deleted: 0, failed: [], remaining: [] }; };
+  return { c, r };
+}
+const settle = () => new Promise((s) => setTimeout(s, 50));
+
+test('a worker that cannot start a browser ends the run at once, with its reason on the page', async () => {
+  const { c, r } = liveRun();
+  // The worker has no run of its own yet - it never got that far - but names the run it was given.
+  c.workerSync({ name: 'local-1', local: true, capacity: 5, runId: 'run1', fatal: 'No browser could be started on this worker. Google Chrome did not start: executable not found', sys: {}, active: 0 });
+  await settle();
+  for (let i = 0; i < 400 && r.state !== 'failed'; i += 1) await settle();
+  assert.strictEqual(r.state, 'failed');
+  assert.match(r.error, /No browser could be started[\s\S]*Capacity and workers/);
+  assert.ok(r.log.some((l) => /Google Chrome did not start/.test(l.text)), 'the reason is in the log');
+});
+
+test('what a worker says before it has started anything still reaches the log', () => {
+  const { c, r } = liveRun();
+  c.workerSync({ name: 'local-1', local: true, capacity: 5, runId: 'run1', log: ["Using Playwright's own Chromium. Google Chrome did not start: not installed"], sys: {}, active: 0 });
+  assert.ok(r.log.some((l) => /Using Playwright's own Chromium/.test(l.text)));
+  assert.match(fs.readFileSync(path.join(root, 'src', 'worker.js'), 'utf8'), /runId: \(current && current\.runId\) \|\| desired\.runId/, 'a worker names the run it was told to join, not only one it has started');
+});
+
+test('the verdict: no step ran is a failure; a test with a failed step fails; a clean test passes', async () => {
+  let { c, r } = liveRun();
+  await c.finish('The test run was given up');
+  assert.deepStrictEqual([r.state, r.verdict], ['failed', 'failed']);
+  assert.match(r.error, /No step ran at all/); assert.match(r.phase, /The test FAILED/);
+
+  ({ c, r } = liveRun());
+  c.sample(r, { step: 0, ok: false, ms: 900, error: 'HTTP 500' });
+  await c.finish('The test run finished');
+  assert.strictEqual(r.state, 'failed'); assert.match(r.error, /did not pass: 1 of 1 step failed/);
+
+  ({ c, r } = liveRun());
+  c.sample(r, { step: 0, ok: true, ms: 900 });
+  await c.finish('The test run finished');
+  assert.deepStrictEqual([r.state, r.verdict, r.error || ''], ['done', 'passed', '']);
+  assert.match(r.phase, /The test PASSED: 1 step, none failed/);
+});
+
+test('a one-user test gives up after its steps\' time limits, not after ten minutes; a stuck user is named while it is stuck', async () => {
+  const { c, r } = liveRun();
+  r.lastTick = Date.now(); r.elapsed = 2 * (60 + 20) + 61;          // (1 step + sign-in) x (limit + 20 s) + 60 s
+  c.workers.set('local-1', { name: 'local-1', lastSeen: Date.now(), sys: {}, active: 1, capacity: 5, activity: [{ id: 0, user: 'lt.001', at: 'opening a browser window', since: Date.now() - 200000 }] });
+  r.elapsed = 10; await c.tick();
+  assert.ok(r.log.some((l) => /lt\.001 has been on "opening a browser window" for \d+ s/.test(l.text)));
+  r.lastTick = Date.now(); r.elapsed = 2 * 80 + 61; await c.tick();
+  for (let i = 0; i < 400 && r.state !== 'failed'; i += 1) await settle();
+  assert.strictEqual(r.state, 'failed'); assert.match(r.error, /did not finish within 4 minutes/);
+});

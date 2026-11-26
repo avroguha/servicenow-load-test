@@ -1,9 +1,9 @@
 [
   {
-    "image": "playwright",
-    "tag": "v1.65.1-noble",
-    "digest": "sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579",
-    "created": "2026-11-13T22:40:52Z",
-    "note": "Multi-arch index (amd64, arm64). Move the pin only to an image more than 72 hours old, together with playwright-core in package.json."
+    "image": "node",
+    "tag": "24.22.2-trixie-slim",
+    "digest": "sha256:0820eaa85e07d0490446dd01d14707e17e6108a36988cf374899cd057eb3812d",
+    "created": "2026-11-05T11:40:52Z",
+    "note": "Docker Hub official image, multi-arch. Move the pin only to an image pushed more than 72 hours ago."
   }
 ]

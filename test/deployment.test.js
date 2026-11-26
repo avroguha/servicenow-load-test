@@ -17,24 +17,27 @@ const home = envOf('home.env');
 const PUBLIC = /registry\.npmjs\.org|pypi\.org|docker\.io|quay\.io|ghcr\.io|mcr\.microsoft\.com|nodejs\.org|cdn\.playwright\.dev/;
 
 test('no site location is written into the image build or the compose file', () => {
-  for (const [name, text] of [['Dockerfile', dockerfile], ['docker-compose.yml', compose]]) assert.ok(!PUBLIC.test(text), `${name} names a public registry`);
-  for (const arg of ['IMAGE_REGISTRY', 'IMAGE_PLAYWRIGHT', 'NPM_REGISTRY', 'NPM_TOKEN', 'CA_BUNDLE_B64', 'HTTP_PROXY', 'HTTPS_PROXY']) assert.match(dockerfile, new RegExp(`^ARG ${arg}=$`, 'm'), `${arg} must default to empty`);
+  // Comments aside, the one public name allowed is the image's own package source inside the sed that REPLACES it with the mirror.
+  const code = (text) => text.replace(/^\s*#.*$/gm, '').replace(/sed -i "s#[^"]*"/g, '');
+  for (const [name, text] of [['Dockerfile', dockerfile], ['docker-compose.yml', compose]]) assert.ok(!PUBLIC.test(code(text)), `${name} names a public registry`);
+  for (const arg of ['IMAGE_REGISTRY', 'APT_MIRROR', 'APT_SECURITY_MIRROR', 'NPM_REGISTRY', 'NPM_TOKEN', 'CA_BUNDLE_B64', 'HTTP_PROXY', 'HTTPS_PROXY']) assert.match(dockerfile, new RegExp(`^ARG ${arg}=$`, 'm'), `${arg} must default to empty`);
   assert.match(dockerfile, /^ARG NO_PROXY=localhost,127\.0\.0\.1$/m);
   assert.match(dockerfile, /\$\{NPM_REGISTRY:\?[^}]+env file/, 'a build without an env file stops with a message');
 });
 
-test('the base image: path from the env file, tag and digest pinned once in the Dockerfile, more than 72 hours old', () => {
-  const m = dockerfile.match(/^FROM \$\{IMAGE_PLAYWRIGHT\}:([\w.-]+)@(sha256:[0-9a-f]{64})$/m);
-  assert.ok(m, 'FROM must take the path from IMAGE_PLAYWRIGHT and carry a tag and a digest');
-  assert.ok(!/[:@]/.test(work.IMAGE_PLAYWRIGHT) && !/[:@]/.test(home.IMAGE_PLAYWRIGHT), 'the env files give the path only; the pin lives in the Dockerfile');
-  assert.match(work.IMAGE_PLAYWRIGHT.split('/')[0], /(^|\.)avro\.com$/, 'work.env must pull the image from the site registry');
-  const pin = JSON.parse(read('image-pins.json')).find((p) => p.digest === m[2]);
+test('the base image is an official Docker Hub image behind the registry prefix, pinned by a digest more than 72 hours old', () => {
+  assert.match(dockerfile, /^FROM \$\{IMAGE_REGISTRY\}\$\{IMAGE_NODE\}$/m, 'the image must be pulled through the registry prefix');
+  const m = dockerfile.match(/^ARG IMAGE_NODE=([a-z0-9]+):([\w.-]+)@(sha256:[0-9a-f]{64})$/m);
+  assert.ok(m, 'the base must be a Docker Hub official image (a bare name, no registry host) with a tag and a digest');
+  const pin = JSON.parse(read('image-pins.json')).find((p) => p.digest === m[3]);
   assert.ok(pin, 'the digest in the Dockerfile is not recorded in image-pins.json');
-  assert.strictEqual(pin.tag, m[1]);
+  assert.deepStrictEqual([pin.image, pin.tag], [m[1], m[2]]);
   assert.ok(Date.now() - Date.parse(pin.created) > 72 * 3600e3, 'the pinned image is younger than 72 hours');
-  // The image carries the browser build that the locked playwright-core expects.
-  const core = JSON.parse(read('package-lock.json')).packages['node_modules/playwright-core'].version;
-  assert.strictEqual(m[1], `v${core}-noble`);
+  // The browser comes from the distribution's package archive (the apt mirror), not from a vendor's download site.
+  assert.match(dockerfile, /apt-get install -y --no-install-recommends chromium /);
+  assert.ok(!/playwright(-core)? install/.test(dockerfile), 'the build must not download a browser');
+  assert.match(dockerfile, /UILOAD_BROWSER_PATH=\/usr\/bin\/chromium/);
+  assert.match(read('src/worker.js'), /executablePath: process\.env\.UILOAD_BROWSER_PATH/);
 });
 
 test('compose requires every location from the env file, and both env files set them all', () => {
@@ -51,7 +54,7 @@ test('compose requires every location from the env file, and both env files set 
 });
 
 test('every build argument the Dockerfile takes is passed by compose, the token included', () => {
-  for (const arg of [...dockerfile.matchAll(/^ARG (\w+)=/gm)].map((x) => x[1])) assert.match(compose, new RegExp(`^\\s+${arg}: \\$\\{${arg}[?-]`, 'm'), `compose does not pass ${arg} to the build`);
+  for (const arg of [...dockerfile.matchAll(/^ARG (\w+)=/gm)].map((x) => x[1]).filter((a) => a !== 'IMAGE_NODE')) assert.match(compose, new RegExp(`^\\s+${arg}: \\$\\{${arg}[?-]`, 'm'), `compose does not pass ${arg} to the build`);
   for (const svc of ['init', 'app']) {
     const block = compose.slice(compose.indexOf(`\n  ${svc}:`));
     assert.match(block.slice(0, 400), /build: \*build\n\s+pull_policy: build/, `${svc} must build the image here, never pull it`);
@@ -59,9 +62,9 @@ test('every build argument the Dockerfile takes is passed by compose, the token 
 });
 
 test('the env files: placeholders at work, public and no proxy at home, no secret in either', () => {
-  for (const k of ['IMAGE_REGISTRY', 'IMAGE_PLAYWRIGHT', 'NPM_REGISTRY', 'HTTP_PROXY', 'HTTPS_PROXY', 'PUBLIC_HOST']) assert.match(work[k], /avro\.com/, `work.env ${k} must be an avro.com placeholder`);
+  for (const k of ['IMAGE_REGISTRY', 'APT_MIRROR', 'NPM_REGISTRY', 'HTTP_PROXY', 'HTTPS_PROXY', 'PUBLIC_HOST']) assert.match(work[k], /avro\.com/, `work.env ${k} must be an avro.com placeholder`);
   assert.match(work.IMAGE_REGISTRY, /^[\w.-]*avro\.com\/$/, 'the registry prefix ends with a slash');
-  assert.strictEqual(home.IMAGE_REGISTRY, '');
+  assert.strictEqual(home.IMAGE_REGISTRY, ''); assert.strictEqual(home.APT_MIRROR, ''); assert.strictEqual(home.APT_SECURITY_MIRROR, '');
   assert.match(new URL(work.NPM_REGISTRY).hostname, /(^|\.)avro\.com$/);
   assert.strictEqual(home.HTTP_PROXY, ''); assert.strictEqual(home.HTTPS_PROXY, ''); assert.strictEqual(home.CA_BUNDLE_B64, ''); assert.strictEqual(work.CA_BUNDLE_B64, '', 'an optional input defaults to empty');
   for (const env of [work, home]) for (const [k, v] of Object.entries(env)) assert.ok(!(/TOKEN|PASSWORD|SECRET|KEY/.test(k) && v), `${k} holds a value in an env file`);
@@ -72,10 +75,10 @@ test('nothing of the build site ships in the image, and it does not run as root'
   const env = dockerfile.match(/^ENV [\s\S]*?(?=\n\n|\nEXPOSE)/m)[0];
   for (const k of ['NPM_TOKEN', 'NPM_REGISTRY', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy']) assert.match(env, new RegExp(`\\b${k}= `), `${k} is not cleared in the final image`);
   assert.match(dockerfile, /rm -rf \/root\/\.npmrc/, 'the npm settings (registry, token) are removed in the step that used them');
-  assert.match(dockerfile, /^USER app$/m);
-  assert.ok(dockerfile.indexOf('USER app') > dockerfile.indexOf('npm ci'));
-  // Ubuntu 24.04 already has a user with uid 1000: without removing it the build fails, or the app gets another id and cannot write its state.
-  assert.match(dockerfile, /userdel -r ubuntu[^\n]*\n\s+groupadd -g 1000 app && useradd -u 1000 -g 1000/);
+  assert.match(dockerfile, /^USER node$/m);
+  assert.ok(dockerfile.indexOf('USER node') > dockerfile.indexOf('npm ci'));
+  // The image's user (uid 1000) must be the id the init step and the certificate script hand files to.
+  assert.match(dockerfile, /chown -R node:node \/state \/app/);
   assert.match(compose, /chown -R 1000:1000 \/state/);
 });
 

@@ -123,6 +123,25 @@ failed, and what to do*:
 | API answers 403 / 429 | the errors themselves | missing role / a rate limit rule |
 | steps time out while workers are at full CPU | the workers | the test machine was the limit, not ServiceNow |
 
+When ServiceNow refuses the Mock SSO identity provider record (it answers
+"Error during insert" with no reason), the app finds out why: an existing
+record with the same entity id, an account without the role, or - building the
+record inactive and field by field - the exact field or the activation that is
+refused. Where only the one-step insert is refused, the step-by-step record
+is used and the run goes on.
+
+A run never sits silent and always ends with a verdict:
+
+- A test (one user, once) ends **PASSED** or **FAILED**, in those words. A run
+  in which no step ran at all is a failure, with the place it stopped.
+- A worker that cannot start a browser tries the other kinds first (the image's
+  own, the one chosen in the app, Chromium, Chrome, Edge) and says which it
+  used; if none starts, the run ends at once with the reasons.
+- A user that stays on one thing far longer than a step may take is named in
+  the log while it is happening. A one-user test gives up after its steps' time
+  limits, not after a fixed ten minutes.
+- A worker process that dies or complains is reported in the run's log.
+
 A page that loads fine but only shows a refusal is counted as a failed step,
 at once, with the page's own message. When an instance's admin connection is
 refused, the Instances page lists the causes to check, most likely first.
@@ -162,8 +181,9 @@ site's real values in, and keep that edit out of git
 
 | Key | What it is |
 |---|---|
-| `IMAGE_REGISTRY` | the site's registry prefix for Docker Hub images, with the trailing slash |
-| `IMAGE_PLAYWRIGHT` | where the site's registry serves the Playwright image from, **without tag** (the Dockerfile pins tag and digest) |
+| `IMAGE_REGISTRY` | the site's Docker registry prefix, with the trailing slash. The base image is the official Node image from Docker Hub, pulled through it |
+| `APT_MIRROR` | the site's mirror of the Debian package archive (the browser is installed from it). Empty = the image's own source, through the proxy |
+| `APT_SECURITY_MIRROR` | the same for Debian security updates. Empty = the image's own source |
 | `NPM_REGISTRY` | the site's npm mirror |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | the proxy for the build |
 | `CA_BUNDLE_B64` | empty, unless the proxy intercepts TLS: then `base64 -w0 site-ca.pem` |
@@ -183,11 +203,24 @@ The build proxy is not the proxy tests use. How a **test** reaches a ServiceNow
 instance is set in the app (ServiceNow > Instances > Proxies), per instance and
 per test.
 
-What the build does: pulls the pinned Playwright image (Ubuntu 24.04 with Node
-and Chromium - no browser download, no system packages), runs `npm ci` against
-the mirror, and refuses any package published in the last 72 hours using the
-committed publish-time record (no registry lookup). It works on the legacy
-builder; buildx is not needed.
+What the build does, and where each thing comes from:
+
+| Step | Source |
+|---|---|
+| base image: official `node` image, pinned by digest | Docker Hub, through `IMAGE_REGISTRY` |
+| the browser: Debian's `chromium` package, plus fonts and curl | the Debian archive, through `APT_MIRROR` or the proxy |
+| `npm ci` (one package, `playwright-core`) | `NPM_REGISTRY` |
+
+Nothing is fetched from a browser vendor's download site, and no image comes
+from a registry other than Docker Hub. After `npm ci` the build refuses any
+package published in the last 72 hours, using the committed publish-time record
+(no registry lookup). It works on the legacy builder; buildx is not needed.
+
+The browser is the distribution's build (Chromium 156 at the time of writing),
+driven by `playwright-core` through the image's `UILOAD_BROWSER_PATH`. It is a
+few versions behind the build Playwright ships for itself; sign-in through SSO,
+page loads, clicks and screenshots were run against it. The browser setting
+under Capacity and workers has no effect in this image.
 
 ### HTTPS and the certificate
 
@@ -238,7 +271,7 @@ Move git, not folders: `git pull` (or a bundle) on the host, then the same
 npm test
 ```
 
-47 tests, no network: the SAML signature (also checked once against
+53 tests, no network: the SAML signature (also checked once against
 `xmlsec1`), the mock sign-in's refusals, checks / creation / cleanup against an
 in-memory instance for every sign-in method, load patterns, limits, the
 two-hour rule, the proxy tunnel, the diagnosis rules, several instances, the

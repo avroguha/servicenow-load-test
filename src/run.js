@@ -142,7 +142,7 @@ class Controller {
       totals: r.totals, stages: r.stages.map(({ ms, ...s }) => s), steps: r.steps.map(({ ms, ...s }) => s), series: r.series,
       speed: last && ['running', 'paused'].includes(r.state) ? { rate: last.rate, reqs: last.reqs, avg: last.avg, p95: last.p95, errors: last.errors } : null,
       limit: r.limit, shots: r.shots, trace: r.trace, advice: r.advice, cleanup: r.cleanup, ledger: r.ledger.length, idp: r.idpStats, elapsed: r.elapsed, planSeconds: r.planSeconds,
-      generatorBusy: r.generatorBusy, activity: ['running', 'paused'].includes(r.state) ? this.activity() : [],
+      verdict: r.verdict || '', generatorBusy: r.generatorBusy, activity: ['running', 'paused'].includes(r.state) ? this.activity() : [],
     };
   }
   activity() {
@@ -251,7 +251,15 @@ class Controller {
       const name = `local-${i + 1}`;
       const proc = spawn(process.execPath, [path.join(__dirname, 'worker.js')], {
         env: { ...process.env, UILOAD_CONTROLLER: `http://127.0.0.1:${this.port}`, UILOAD_WORKER_TOKEN: settings.workerToken, UILOAD_WORKER_NAME: name, UILOAD_WORKER_CAPACITY: String(per), UILOAD_WORKER_LOCAL: '1', UILOAD_WORKER_API: api ? '1' : '' },
-        stdio: 'ignore', windowsHide: true,
+        stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true,
+      });
+      // A worker that dies, or complains, must not do so unheard.
+      let said = 0;
+      proc.stderr.on('data', (d) => { if (said < 20 && this.run === r) { said += 1; this.log(`[${name}] ${String(d).trim().split('\n')[0].slice(0, 300)}`); } });
+      proc.on('exit', (code) => {
+        if (this.run !== r || r.finishing || ['done', 'failed'].includes(r.state)) return;
+        this.log(`[${name}] the worker process ended unexpectedly (exit code ${code}).`);
+        if (r.kind === 'build' || this.children.every((c) => c.exitCode !== null)) this.fail(new Error(`The worker process ${name} ended unexpectedly (exit code ${code}); see the log.`)).catch(() => {});
       });
       this.children.push(proc);
     }
@@ -295,7 +303,9 @@ class Controller {
     if (r.kind === 'build') {
       r.target = 1;
       if (r.finished.size >= 1) { await this.finish('The test run finished'); return; }
-      if (r.elapsed > 600) { await this.finish('The test run gave up after 10 minutes'); return; }
+      // One user, once: it cannot honestly need more than every step's time limit plus a margin.
+      const most = (r.steps.length + 1) * (r.scenario.load.timeoutSeconds + 20) + 60;
+      if (r.elapsed > most) { r.error = r.error || `The test did not finish within ${Math.round(most / 60)} minutes.`; await this.finish('The test run was given up'); return; }
     } else if (r.state === 'running') {
       const stageNo = Math.floor(r.elapsed / p.stepSeconds);
       const users = Math.min(p.max, p.start + stageNo * p.step, r.users.length);
@@ -314,6 +324,13 @@ class Controller {
         if (r.finished.size >= r.users.length) { this.closeStage(r, st, false); await this.finish('Every user finished'); return; }
         if (r.elapsed > longest) { this.closeStage(r, st, false); await this.finish('Some users did not finish in time'); return; }
       } else if (r.elapsed >= r.planSeconds) { this.closeStage(r, st, false); await this.finish('The plan is complete'); return; }
+    }
+    // A user that has sat on one thing far longer than a step may take: say so, once, while it is happening.
+    const patience = (r.scenario.load.timeoutSeconds + 45) * 1000;
+    r.stalled = r.stalled || new Set();
+    for (const a of this.activity()) {
+      const key = `${a.id}:${a.at}:${a.since}`;
+      if (!a.done && a.at !== 'waiting' && now - a.since > patience && !r.stalled.has(key) && r.stalled.size < 20) { r.stalled.add(key); this.log(`${a.user} has been on "${a.at}" for ${Math.round((now - a.since) / 1000)} s without finishing it.`); }
     }
     const busy = [...this.workers.values()].some((w) => now - w.lastSeen < 6000 && w.active > 0 && w.sys.cpu >= 90);
     if (busy && r.stages.length) r.stages[r.stages.length - 1].busy = true;
@@ -358,6 +375,12 @@ class Controller {
     if (!w) { w = { name }; this.workers.set(name, w); }
     Object.assign(w, { capacity: Number(body.capacity) || 1, local: !!body.local, api: !!body.api, host: body.host || '', lastSeen: Date.now(), sys: body.sys || {}, active: Number(body.active) || 0, activity: Array.isArray(body.activity) ? body.activity : [] });
     const r = this.run;
+    if (r && body.runId === r.id && body.fatal && this.busy() && !r.finishing && !r.stopAsked) {
+      // The worker cannot do its part at all (no browser). Waiting would only hide it.
+      const others = [...this.workers.values()].filter((x) => x !== w && Date.now() - x.lastSeen < 6000 && x.active > 0).length;
+      this.log(`[${name}] ${body.fatal}`);
+      if (r.kind === 'build' || !others) this.fail(new Error(`${body.fatal} Check the browser under Administration > Capacity and workers.`)).catch(() => {});
+    }
     if (r && body.runId === r.id) {
       for (const s of body.samples || []) this.sample(r, s);
       for (const sh of body.shots || []) this.shot(r, sh);
@@ -412,7 +435,7 @@ class Controller {
     const r = this.run;
     if (!r || !this.busy()) throw new Error('No run is active.');
     if (r.stopAsked) return;
-    r.stopAsked = true;
+    r.stopAsked = true; r.stopAskedByUser = /^Stopped by /.test(why);
     this.log(why);
     if (['running', 'paused'].includes(r.state)) this.finish(why).catch((e) => this.fail(e));
   }
@@ -448,8 +471,17 @@ class Controller {
     r.phase = `${why} - removing what the run created on the instance`; this.notify();
     await this.clean(r);
     r.endedAt = Date.now();
+    // The verdict, in words. A run in which nothing ran is a failure, not a result.
+    const t = r.totals;
+    const reached = !!r.startedAt;
+    if (reached && !t.n && !r.stopAskedByUser) { failed = true; r.error = r.error || 'No step ran at all. The users never got as far as the first step - the log below says where it stopped.'; }
+    if (r.kind === 'build' && t.n) {
+      if (t.errors) { failed = true; r.error = r.error || `The test did not pass: ${t.errors} of ${t.n} step${t.n === 1 ? '' : 's'} failed.`; }
+      r.verdict = t.errors ? 'failed' : 'passed';
+    } else r.verdict = failed ? 'failed' : (r.kind === 'build' ? 'failed' : 'completed');
     r.state = failed ? 'failed' : 'done';
-    r.phase = r.cleanup.complete ? `${why}. Everything created for the run has been removed.` : `${why}. CLEANUP IS NOT COMPLETE - it will be tried again automatically.`;
+    const outcome = r.kind === 'build' ? (r.verdict === 'passed' ? `The test PASSED: ${t.n} step${t.n === 1 ? '' : 's'}, none failed` : 'The test FAILED') : why;
+    r.phase = r.cleanup.complete ? `${outcome}. Everything created for the run has been removed.` : `${outcome}. CLEANUP IS NOT COMPLETE - it will be tried again automatically.`;
     this.log(r.phase); this.persist(); this.notify();
   }
 

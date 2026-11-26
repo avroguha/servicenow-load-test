@@ -285,7 +285,7 @@ function runHtml(r, workers, isLive) {
   const order = PHASES.map((p) => p[0]); const at = order.indexOf(r.state === 'paused' ? 'running' : r.state === 'failed' ? 'done' : r.state);
   const h = [];
   const ctl = isLive && active ? `<button class="btn" data-run="pause" ${r.state === 'running' && r.kind !== 'build' ? '' : 'disabled'}>Pause</button><button class="btn" data-run="resume" ${r.state === 'paused' ? '' : 'disabled'}>Resume</button><button class="btn danger" data-run="stop" ${r.state === 'stopping' ? 'disabled' : ''} title="Ends the load and removes everything the run created on the instance.">Stop and clean up</button>` : (isLive ? `<a class="btn" href="#/tests/${sc.id}">Open the test</a>` : '<a class="btn" href="#/history">Back to history</a>');
-  h.push(head(`${r.kind === 'build' ? 'Test run' : PATTERN[sc.load.pattern]}: ${sc.name}`, `<span class="pill ${r.state}">${esc(r.state)}</span> &nbsp;${esc(r.phase || '')}`, ctl));
+  h.push(head(`${r.kind === 'build' ? 'Test run' : PATTERN[sc.load.pattern]}: ${sc.name}`, `<span class="pill ${r.verdict === 'passed' ? 'good' : r.state}">${esc(r.verdict === 'passed' ? 'passed' : r.state)}</span> &nbsp;${esc(r.phase || '')}`, ctl));
 
   h.push(`<div class="card"><div class="steps-flow">${PHASES.map(([k, label], i) => `<span class="phase ${i < at || r.state === 'done' ? 'done' : i === at ? 'on' : ''}">${label}</span>`).join('')}</div>
     ${r.kind === 'load' && r.planSeconds ? `<div class="progress"><i style="width:${Math.min(100, (100 * r.elapsed) / r.planSeconds).toFixed(1)}%"></i></div><p class="hint" style="margin:6px 0 0">${fmtDur(r.elapsed)} of ${fmtDur(r.planSeconds)} planned</p>` : ''}
@@ -293,7 +293,8 @@ function runHtml(r, workers, isLive) {
       <dt>Started</dt><dd>${fmtTime(r.createdAt)}${r.by ? ` by ${esc(r.by)}` : ''} · run ${esc(r.id)}</dd>
       <dt>On the instance</dt><dd>${r.cleanup ? (r.cleanup.complete ? `<span class="pill good">removed</span> ${r.cleanup.deleted} record(s) deleted, nothing left` : `<span class="pill bad">cleanup pending</span> ${(r.cleanup.remaining || []).length} record(s) may remain - retried automatically <button class="btn small" data-clean="${r.id}">Clean up now</button>`)
     : r.ledger ? `${plural(r.ledger, 'record')} created for this run · removed when it ends, and no later than ${new Date(r.removeBy).toLocaleTimeString([], { timeStyle: 'short' })}` : 'nothing created yet'}</dd></dl>
-    ${r.error ? `<div class="banner bad">${esc(r.error)}</div>` : ''}
+    ${r.kind === 'build' && r.verdict === 'passed' ? `<div class="banner ok">Passed: all ${(r.totals || {}).n || 0} step(s) succeeded with one user. The test is ready for load.</div>` : ''}
+    ${r.error ? `<div class="banner bad">${r.kind === 'build' ? 'Failed. ' : ''}${esc(r.error)}</div>` : ''}
     ${r.limit ? `<div class="banner limit">Limit reached at ${r.limit.users} users: ${esc(r.limit.reason)}.<small>${r.limit.lastGood ? `The last step that stayed inside the limit was ${r.limit.lastGood} users.` : 'No earlier step stayed inside the limit.'}${r.limit.generatorBusy ? ' The load generator was at full CPU in that step, so this may be the test machine and not ServiceNow.' : ''}</small></div>`
     : r.kind === 'load' && r.state === 'done' && r.stages.length ? `<div class="banner ok">No limit reached up to ${Math.max(...r.stages.map((s) => s.users))} users at the same time.</div>` : ''}
     ${isLive && r.generatorBusy ? '<div class="banner limit">A worker machine is at 90% CPU or more: times measured now include the test machine being slow.</div>' : ''}</div>`);

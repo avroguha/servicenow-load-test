@@ -117,10 +117,11 @@ class VU {
       } catch { /* fall through to a new context */ }
     }
     if (this.ctx) await this.ctx.close().catch(() => {});
-    this.ctx = await this.run.browser.newContext({ viewport: cfg.viewport, ignoreHTTPSErrors: true });
+    this.doing('opening a browser window');
+    this.ctx = await within(this.run.browser.newContext({ viewport: cfg.viewport, ignoreHTTPSErrors: true }), 30000, 'opening a browser window');
     this.ctx.setDefaultTimeout(cfg.timeoutMs);
     if (cfg.authMode === 'sso') await this.ctx.addCookies([{ name: 'uiload_idp', value: this.spec.ticket, url: cfg.idpBaseUrl, httpOnly: true }]);
-    this.page = await this.ctx.newPage();
+    this.page = await within(this.ctx.newPage(), 30000, 'opening a browser tab');
     this.w = watch(this.page);
     this.signedIn = false;
   }
@@ -171,7 +172,7 @@ class VU {
     if (u.origin !== cfg.origin) return `left the instance: ${u.origin}${u.pathname}`;
     if (LOGIN_PATH.test(u.pathname)) return `not signed in (landed on ${u.pathname})`;
     try {
-      if (await this.page.locator('input[name="user_password"]').count()) return 'not signed in (the login page was shown)';
+      if (await within(this.page.locator('input[name="user_password"]').count(), 5000, 'reading the page')) return 'not signed in (the login page was shown)';
     } catch { /* navigating */ }
     return '';
   }
@@ -180,7 +181,7 @@ class VU {
   async refusal() {
     for (const f of this.page.frames()) {
       let text = '';
-      try { text = await f.evaluate(() => (document.body ? document.body.innerText.slice(0, 4000) : '')); } catch { continue; }
+      try { text = await within(f.evaluate(() => (document.body ? document.body.innerText.slice(0, 4000) : '')), 4000, 'reading the page'); } catch { continue; }
       const m = text.match(REFUSAL);
       if (m) return `the page says: ${m[0]}`;
     }
@@ -386,8 +387,7 @@ class ApiVU extends VU {
 // ---- making the desired state true ----------------------------------------
 async function launch(cfg) {
   const { chromium } = require('playwright-core');
-  const opts = { headless: cfg.headless !== false, args: ['--disable-dev-shm-usage', '--no-default-browser-check'] };
-  if (cfg.browser && cfg.browser !== 'chromium') opts.channel = cfg.browser;
+  const opts = { headless: cfg.headless !== false, timeout: 45000, args: ['--disable-dev-shm-usage', '--no-default-browser-check'] };
   if (cfg.proxy) {
     // The mock sign-in pages are served by this app itself: never through the proxy.
     const p = new URL(cfg.proxy);
@@ -396,7 +396,28 @@ async function launch(cfg) {
     opts.proxy = { server: `${p.protocol}//${p.host}`, bypass: ['127.0.0.1', 'localhost', idpHost].filter(Boolean).join(',') };
     if (p.username) { opts.proxy.username = decodeURIComponent(p.username); opts.proxy.password = decodeURIComponent(p.password); }
   }
-  return chromium.launch(opts);
+  // Which browser: the one this image ships (it wins - the app's setting may
+  // name a browser this machine does not have), then the one chosen in the app,
+  // then every other kind. The setting being wrong must not stop a run when a
+  // usable browser is right there.
+  const kinds = { chromium: ["Playwright's own Chromium", {}], chrome: ['Google Chrome', { channel: 'chrome' }], msedge: ['Microsoft Edge', { channel: 'msedge' }] };
+  const tries = [];
+  if (process.env.UILOAD_BROWSER_PATH) tries.push([`the browser at ${process.env.UILOAD_BROWSER_PATH}`, { executablePath: process.env.UILOAD_BROWSER_PATH }]);
+  for (const k of [cfg.browser || 'chrome', 'chromium', 'chrome', 'msedge']) if (kinds[k] && !tries.some((t) => t[0] === kinds[k][0])) tries.push(kinds[k]);
+  const failed = [];
+  for (const [name, how] of tries) {
+    try {
+      const b = await chromium.launch({ ...opts, ...how });
+      if (failed.length) out.log.push(`Using ${name}. ${failed[0]}`);
+      return b;
+    } catch (err) { failed.push(`${name} did not start: ${String(err.message).split('\n')[0].slice(0, 200)}`); }
+  }
+  throw new Error(failed.join(' | '));
+}
+// A promise that must not be able to hang a user for ever.
+function within(promise, ms, what) {
+  let t;
+  return Promise.race([promise, new Promise((_, no) => { t = setTimeout(() => no(new Error(`${what} did not finish in ${Math.round(ms / 1000)} s`)), ms); })]).finally(() => clearTimeout(t));
 }
 async function endRun() {
   const run = current; current = null;
@@ -411,7 +432,8 @@ async function reconcile() {
   if (!current) {
     current = { runId: desired.runId, cfg: desired.config, vus: new Map(), errorShots: 0, browser: null };
     if (current.cfg.type !== 'api') try { current.browser = await launch(current.cfg); } catch (err) {
-      out.log.push(`The browser did not start: ${String(err.message).split('\n')[0]}`);
+      // Nothing can run without a browser: tell the controller, which ends the run with this reason.
+      out.fatal = `No browser could be started on this worker. ${err.message}`;
       current = null; await sleep(5000); return;
     }
   }
@@ -425,7 +447,9 @@ async function reconcile() {
 
 async function sync() {
   const body = {
-    name: NAME, capacity: CAPACITY, local: LOCAL, api: process.env.UILOAD_WORKER_API === '1', host: os.hostname(), runId: current ? current.runId : '',
+    name: NAME, capacity: CAPACITY, local: LOCAL, api: process.env.UILOAD_WORKER_API === '1', host: os.hostname(),
+    // The run this worker is on, or has been told to be on: a worker that could not even start still has something to say about it.
+    runId: (current && current.runId) || desired.runId || '', fatal: out.fatal || '',
     active: current ? [...current.vus.values()].filter((v) => !v.done).length : 0,
     sys: { cpu: cpuPercent(), freeMb: Math.round(os.freemem() / 1048576), totalMb: Math.round(os.totalmem() / 1048576) },
     samples: out.samples.splice(0), shots: out.shots.splice(0, 4), traces: out.traces.splice(0, 30), finished: out.finished.splice(0), log: out.log.splice(0),
@@ -438,6 +462,7 @@ async function sync() {
     });
     if (r.status === 401) { console.error('worker: the controller refused the token'); process.exit(2); }
     desired = await r.json();
+    out.fatal = '';
     sync.failures = 0;
   } catch (err) {
     // Keep what could not be delivered; a worker that has lost its controller
