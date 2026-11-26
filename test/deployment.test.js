@@ -131,3 +131,21 @@ test('the certificate script never shows the password and has its own test', () 
   assert.match(s, /-checkip/); assert.match(s, /-checkhost/);
   assert.ok(fs.existsSync(path.join(root, 'scripts', 'test-install-cert.sh')));
 });
+
+test('the worker compose file follows the same rules, and takes its token from a file', () => {
+  const wc = read('docker-compose.worker.yml');
+  assert.ok(!PUBLIC.test(wc.replace(/^\s*#.*$/gm, '')), 'docker-compose.worker.yml names a public registry');
+  for (const v of [...wc.matchAll(/\$\{(\w+)([^}]*)\}/g)].map((x) => ({ name: x[1], rest: x[2] }))) {
+    if (v.name === 'NPM_TOKEN') { assert.strictEqual(v.rest, '-'); continue; }
+    assert.match(v.rest, /^\?.+/, `${v.name} must be required with a message`);
+    assert.ok(v.name in work, `work.env does not set ${v.name}`);
+    assert.ok(v.name in home, `home.env does not set ${v.name}`);
+  }
+  for (const arg of [...dockerfile.matchAll(/^ARG (\w+)=/gm)].map((x) => x[1]).filter((a) => a !== 'IMAGE_NODE')) assert.match(wc, new RegExp(`^\\s+${arg}: \\$\\{${arg}[?-]`, 'm'), `the worker compose file does not pass ${arg} to the build`);
+  assert.strictEqual((wc.match(/build: \*build\n\s+pull_policy: build/g) || []).length, 2, 'both services build the image here');
+  assert.match(wc, /UILOAD_WORKER_TOKEN_FILE: \/worker\/join/);
+  assert.ok(!/UILOAD_WORKER_TOKEN:/.test(wc), 'the token is a file, not an environment variable');
+  assert.ok(!/^\s*ports:/m.test(wc), 'a worker publishes no port: it only makes outgoing connections');
+  assert.match(work.WORKER_CONTROLLER_URL, /^https:\/\/[\w.-]*avro\.com$/);
+  assert.strictEqual(work.WORKER_ACCEPT_ANY_CERTIFICATE, '', 'at work the certificate is checked');
+});

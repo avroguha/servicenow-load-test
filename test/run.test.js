@@ -227,3 +227,28 @@ test('a click on the text inside a card or button still selects it', () => {
   assert.match(ui, /t\.closest\('\[data-choice\],\[data-add\],\[data-del\],\[data-up\],\[data-down\]'\)/);
   assert.match(ui, /const d = actor\.dataset/);
 });
+
+// ---- a worker on another machine --------------------------------------------
+test('a worker says in words why it cannot reach the controller', () => {
+  const { whyNot } = require('../src/worker');
+  assert.match(whyNot(Object.assign(new Error('self-signed certificate'), { code: 'DEPTH_ZERO_SELF_SIGNED_CERT' })), /does not trust the controller's certificate[\s\S]*--ca <file>[\s\S]*--insecure/);
+  assert.match(whyNot(Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:443'), { code: 'ECONNREFUSED' })), /nothing answers at/);
+  assert.match(whyNot(Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' })), /firewall[\s\S]*HTTPS port/);
+  const w = fs.readFileSync(path.join(root, 'src', 'worker.js'), 'utf8');
+  assert.match(w, /sync\.failures === 1 \|\| sync\.failures % 30 === 0\) console\.error/, 'a failed connection is reported at once, not swallowed');
+  assert.match(w, /rejectUnauthorized: !INSECURE/);
+  assert.ok(!/fetch\(`\$\{CONTROLLER\}/.test(w), 'the controller is reached through talk(), which knows --ca and --insecure');
+});
+
+test('the sign-in pages are answered on the worker\'s own machine, so the record on the instance is the same for every worker', () => {
+  const { relayWanted } = require('../src/worker');   // this process: controller http://127.0.0.1:8787, not a local worker
+  const sso = { type: 'ui', authMode: 'sso' };
+  assert.strictEqual(relayWanted({ ...sso, idpBaseUrl: 'http://127.0.0.1:8787' }), 0, 'the app itself answers on its own port');
+  assert.strictEqual(relayWanted({ ...sso, idpBaseUrl: 'http://127.0.0.1:8790' }), 8790, 'another port needs the relay');
+  assert.strictEqual(relayWanted({ ...sso, idpBaseUrl: 'https://loadtest.example' }), 0, 'a public address is reached by the browsers directly');
+  assert.strictEqual(relayWanted({ type: 'ui', authMode: 'local', idpBaseUrl: 'http://127.0.0.1:8790' }), 0);
+  assert.strictEqual(relayWanted({ type: 'api', authMode: 'sso', idpBaseUrl: 'http://127.0.0.1:8790' }), 0);
+  const w = fs.readFileSync(path.join(root, 'src', 'worker.js'), 'utf8');
+  assert.match(w, /srv\.listen\(port, '127\.0\.0\.1'/, 'the relay listens on loopback only');
+  assert.match(w, /if \(!req\.url\.startsWith\('\/idp\/'\)\)/, 'and passes on nothing but the sign-in pages');
+});

@@ -154,8 +154,45 @@ refused, the Instances page lists the causes to check, most likely first.
   worker reaches 90% CPU the run says so and marks that stretch: the slowdown
   may be the test machine.
 - API users are light: hundreds from one machine (default limit 2000).
-- For more browsers, add workers on other machines (Capacity and workers shows
-  the command).
+- For more browsers, add workers on other machines (next section).
+
+### Workers on other machines
+
+A worker is the same image started as a worker. On the other machine:
+
+```bash
+# set the WORKER_* lines of the env file first (where the app is, how many browsers)
+mkdir -p ../uiload-worker
+printf '%s' '<worker token>' > ../uiload-worker/join     # Administration > Capacity and workers shows it
+docker compose -f docker-compose.worker.yml --env-file work.env up --build -d
+docker compose -f docker-compose.worker.yml --env-file work.env logs -f worker
+```
+
+Without Docker: Node.js and a browser on the machine, `npm ci`, then
+`node src/worker.js --controller https://<app> --token-file join --capacity 10`.
+
+- **Ports.** The worker only makes outgoing connections: to the app's HTTPS
+  port (443) and to ServiceNow or the proxy. Nothing is opened towards the
+  worker machine. Port 8787 is not used between machines.
+- **The app's certificate.** The worker checks it. If it comes from an
+  authority the image does not know (or is the app's own self-signed one), put
+  that certificate or its authority as `ca.pem` into `WORKER_DIR` (without
+  Docker: `--ca file`). `WORKER_ACCEPT_ANY_CERTIFICATE=1` (`--insecure`)
+  accepts any certificate - the worker token then goes to whoever answers, so
+  that is for a lab only.
+- **Mock SSO.** ServiceNow sends a test browser to
+  `http://127.0.0.1:8787/idp/sso` - an address on the browser's own machine.
+  On the app's machine the app answers there; on a worker machine the worker
+  does, and passes the request to the app over its own connection. So the
+  record on the instance is the same wherever the browsers run, and nothing
+  needs changing for a remote worker. If port 8787 is taken on a worker
+  machine, set another one under Capacity and workers ("Address of this app as
+  the workers' browsers see it", for example `http://127.0.0.1:8790`).
+- **When it does not connect**, the worker says why, at once and every half
+  minute (certificate not trusted, nothing answering, name not found, wrong
+  token). A connected worker is listed under Capacity and workers.
+- Raise "Most browsers at once" under Capacity and workers: the default is
+  worked out from the app's own machine.
 - A step is timed until the page has had no request in flight for 0.7 s
   (long-lived channels are ignored) - closer to "the page is usable" than the
   browser's load event.

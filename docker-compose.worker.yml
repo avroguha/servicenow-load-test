@@ -1,0 +1,70 @@
+# A worker on ANOTHER machine: more browsers (or API users) for the same app.
+# It is the same image, started as a worker instead of as the app.
+#
+#   mkdir -p ../uiload-worker
+#   printf '%s' '<worker token>' > ../uiload-worker/join      # from Administration > Capacity and workers
+#   docker compose -f docker-compose.worker.yml --env-file work.env up --build -d     # office
+#   docker compose -f docker-compose.worker.yml --env-file home.env up --build -d     # home lab
+#
+# The worker only makes outgoing connections: to the app (its HTTPS port) and
+# to ServiceNow (or the proxy). Nothing has to be opened towards this machine.
+# The WORKER_* lines of the env file say where the app is.
+
+x-build: &build
+  context: .
+  args:
+    IMAGE_REGISTRY: ${IMAGE_REGISTRY?set IMAGE_REGISTRY in the env file - the site registry prefix with its trailing slash, or empty}
+    APT_MIRROR: ${APT_MIRROR?set APT_MIRROR in the env file - the site's Debian mirror, or empty to use the image's own sources}
+    APT_SECURITY_MIRROR: ${APT_SECURITY_MIRROR?set APT_SECURITY_MIRROR in the env file - the site's Debian security mirror, or empty}
+    NPM_REGISTRY: ${NPM_REGISTRY?set NPM_REGISTRY in the env file}
+    NPM_TOKEN: ${NPM_TOKEN-}
+    CA_BUNDLE_B64: ${CA_BUNDLE_B64?set CA_BUNDLE_B64 in the env file - leave it empty unless the proxy intercepts TLS}
+    HTTP_PROXY: ${HTTP_PROXY?set HTTP_PROXY in the env file - empty for none}
+    HTTPS_PROXY: ${HTTPS_PROXY?set HTTPS_PROXY in the env file - empty for none}
+    NO_PROXY: ${NO_PROXY?set NO_PROXY in the env file}
+
+services:
+  # Runs first, as root, with no network: gives the worker's folder (the token
+  # file, and ca.pem when there is one) to the unprivileged user of the image.
+  worker-init:
+    image: sn-load-test:local
+    build: *build
+    pull_policy: build
+    user: "0:0"
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    command: ["sh", "-c", "test -s /worker/join || { echo 'The worker token is missing: put it in the file named join in WORKER_DIR (see the top of docker-compose.worker.yml).' >&2; exit 1; }; chown -R 1000:1000 /worker && chmod 700 /worker && chmod 600 /worker/join"]
+    volumes:
+      - ${WORKER_DIR?set WORKER_DIR in the env file - the folder that holds the worker token file (join) and, if needed, ca.pem}:/worker
+    restart: "no"
+
+  worker:
+    image: sn-load-test:local
+    build: *build
+    pull_policy: build
+    depends_on:
+      worker-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    init: true                     # reaps the browser processes
+    # ca.pem in WORKER_DIR, when present, is the certificate (or authority) the
+    # worker trusts for the app; without it the machine's own trust store is used.
+    command: ["sh", "-c", "if [ -s /worker/ca.pem ]; then export UILOAD_CONTROLLER_CA=/worker/ca.pem; fi; exec node src/worker.js"]
+    environment:
+      UILOAD_CONTROLLER: ${WORKER_CONTROLLER_URL?set WORKER_CONTROLLER_URL in the env file - the address people open the load test app at, https://...}
+      UILOAD_WORKER_TOKEN_FILE: /worker/join
+      UILOAD_WORKER_CAPACITY: ${WORKER_CAPACITY?set WORKER_CAPACITY in the env file - browsers this machine may run at once, about 2.5 per CPU core}
+      UILOAD_WORKER_NAME: ${WORKER_NAME?set WORKER_NAME in the env file - what this worker is called on the Capacity and workers page; empty = the container's name}
+      UILOAD_CONTROLLER_INSECURE: ${WORKER_ACCEPT_ANY_CERTIFICATE?set WORKER_ACCEPT_ANY_CERTIFICATE in the env file - 1 accepts any certificate from the app (lab only), empty checks it}
+      UILOAD_DATA: /tmp/uiload
+      UILOAD_CERTS: ""
+    volumes:
+      - ${WORKER_DIR?set WORKER_DIR in the env file}:/worker:ro
+    healthcheck:
+      disable: true                # the image's check asks the app's own port, which a worker does not serve
+    shm_size: "1gb"                # browsers
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 30s

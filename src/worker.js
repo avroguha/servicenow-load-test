@@ -1,7 +1,7 @@
 'use strict';
 // A load worker: one browser, many virtual users (one browser context each).
 //
-//   node src/worker.js --controller http://host:8787 --token <worker token> [--name w1] [--capacity 10]
+//   node src/worker.js --controller https://host --token-file <file> [--name w1] [--capacity 10] [--ca <file> | --insecure]
 //
 // The worker asks the controller once a second what should be running and
 // makes that true: start the users it was given, hold them while the run is
@@ -9,6 +9,9 @@
 // (and screenshots) with the same call. The controller starts local workers by
 // itself; run this by hand only to add another machine.
 const os = require('node:os');
+const fs = require('node:fs');
+const http = require('node:http');
+const https = require('node:https');
 const { request } = require('./http');
 
 const arg = (flag, env, dflt) => {
@@ -16,7 +19,11 @@ const arg = (flag, env, dflt) => {
   return i >= 0 ? process.argv[i + 1] : (process.env[env] || dflt);
 };
 const CONTROLLER = String(arg('--controller', 'UILOAD_CONTROLLER', 'http://127.0.0.1:8787')).replace(/\/+$/, '');
-const TOKEN = arg('--token', 'UILOAD_WORKER_TOKEN', '');
+// The token: given directly, or (better) in a file only this user can read.
+const TOKEN_FILE = arg('--token-file', 'UILOAD_WORKER_TOKEN_FILE', '');
+let TOKEN = arg('--token', 'UILOAD_WORKER_TOKEN', '');
+const CA_FILE = arg('--ca', 'UILOAD_CONTROLLER_CA', '');
+const INSECURE = process.argv.includes('--insecure') || process.env.UILOAD_CONTROLLER_INSECURE === '1';
 const NAME = arg('--name', 'UILOAD_WORKER_NAME', `${os.hostname()}-${process.pid}`);
 const CAPACITY = Number(arg('--capacity', 'UILOAD_WORKER_CAPACITY', 10)) || 10;
 const LOCAL = process.env.UILOAD_WORKER_LOCAL === '1';
@@ -41,6 +48,99 @@ function cpuPercent() {
   const prev = lastCpu; lastCpu = now;
   if (!prev || now.total === prev.total) return 0;
   return Math.round(100 * (1 - (now.idle - prev.idle) / (now.total - prev.total)));
+}
+
+// ---- talking to the controller ---------------------------------------------
+// From another machine the controller is reached over HTTPS, and its
+// certificate is often one this machine has no reason to trust (the app's own
+// self-signed one, or a company authority Node does not know). Two answers:
+// --ca <file> names the certificate (or its authority) to trust, and
+// --insecure accepts any certificate - the worker token then travels to
+// whoever answers, so that is for a lab only.
+const talkAgent = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) };
+let caPem;
+function talk(method, pathAndQuery, headers, body, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(CONTROLLER + pathAndQuery);
+    const tls = u.protocol === 'https:';
+    if (tls && CA_FILE && caPem === undefined) caPem = fs.readFileSync(CA_FILE);
+    const req = (tls ? https : http).request(u, {
+      method, headers: { ...headers, ...(body != null ? { 'Content-Length': Buffer.byteLength(body) } : {}) }, agent: talkAgent[u.protocol], timeout: timeoutMs,
+      ...(tls ? { rejectUnauthorized: !INSECURE, ...(caPem ? { ca: caPem } : {}) } : {}),
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('no answer from the controller within the time limit')));
+    req.on('error', reject);
+    if (body != null) req.write(body);
+    req.end();
+  });
+}
+// Why the controller cannot be reached, in words, with what to do about it.
+function whyNot(err) {
+  const m = `${err.code || ''} ${err.message || err}`;
+  if (/self.signed|SELF_SIGNED|UNABLE_TO_VERIFY|unable to verify|unable to get (local )?issuer|CERT_/i.test(m)) return `this machine does not trust the controller's certificate (${err.code || err.message}). Give the certificate, or the authority that signed it, as ca.pem in the worker folder (Docker) or with --ca <file>; in a lab, WORKER_ACCEPT_ANY_CERTIFICATE=1 or --insecure (UILOAD_CONTROLLER_INSECURE=1) accepts any certificate.`;
+  if (/ALTNAME|does not match/i.test(m)) return `the controller's certificate is for another name than ${new URL(CONTROLLER).hostname}. Use the name the certificate was made for, or --ca with a certificate that carries this name.`;
+  if (/ECONNREFUSED/.test(m)) return `nothing answers at ${CONTROLLER} (connection refused). Check the address and the port: with HTTPS on, workers use the same address people open in the browser.`;
+  if (/ENOTFOUND|EAI_AGAIN/.test(m)) return `the name ${new URL(CONTROLLER).hostname} cannot be resolved from this machine.`;
+  if (/ETIMEDOUT|time limit|EHOSTUNREACH|ENETUNREACH/.test(m)) return `${CONTROLLER} cannot be reached from this machine (no answer). A firewall between the two machines must allow this machine to open the controller's HTTPS port.`;
+  return String(err.message || err);
+}
+
+// ---- the sign-in pages, on this machine ------------------------------------
+// ServiceNow sends a test browser to the address in the run's identity
+// provider record, and that address is on the browser's own machine
+// (http://127.0.0.1:<port>). On the controller's machine the app itself answers
+// there. On any other machine this relay does: it listens on that port, on
+// loopback only, and passes the request to the controller. So the record on the
+// instance is the same wherever the browsers run, and no browser has to trust
+// the controller's certificate.
+let relay = null;
+function relayWanted(cfg) {
+  if (cfg.type === 'api' || cfg.authMode !== 'sso') return 0;
+  try {
+    const u = new URL(cfg.idpBaseUrl);
+    if (!['127.0.0.1', 'localhost'].includes(u.hostname) || u.protocol !== 'http:') return 0;   // the browsers reach the app directly
+    const c = new URL(CONTROLLER);
+    if (['127.0.0.1', 'localhost'].includes(c.hostname) && (c.port || '80') === (u.port || '80')) return 0;   // the controller is right here
+    return Number(u.port || 80);
+  } catch { return 0; }
+}
+function startRelay(port) {
+  return new Promise((resolve, reject) => {
+    const srv = http.createServer((req, res) => {
+      if (!req.url.startsWith('/idp/')) { res.writeHead(404); res.end(); return; }
+      const chunks = [];
+      req.on('data', (c) => { if (chunks.length < 64) chunks.push(c); });
+      req.on('end', async () => {
+        try {
+          const headers = {};
+          for (const h of ['cookie', 'content-type']) if (req.headers[h]) headers[h] = req.headers[h];
+          const r = await talk(req.method, req.url, headers, req.method === 'POST' ? Buffer.concat(chunks) : null, 30000);
+          const back = {};
+          for (const h of ['content-type', 'cache-control']) if (r.headers[h]) back[h] = r.headers[h];
+          res.writeHead(r.status, back); res.end(r.body);
+        } catch (err) {
+          res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end(`The worker could not pass the sign-in to the controller: ${whyNot(err)}`);
+        }
+      });
+    });
+    srv.once('error', async (err) => {
+      if (err.code !== 'EADDRINUSE') { reject(err); return; }
+      // Another worker on this machine may already be answering there: that is as good.
+      const ours = await new Promise((s) => {
+        const q = http.get({ host: '127.0.0.1', port, path: '/idp/logout', timeout: 5000 }, (r) => { let t = ''; r.on('data', (c) => { t += c; }); r.on('end', () => s(r.statusCode === 200 && /test identity provider/.test(t))); });
+        q.on('error', () => s(false)); q.on('timeout', () => { q.destroy(); s(false); });
+      });
+      if (ours) { resolve(null); return; }
+      reject(new Error(`Port ${port} on this worker machine is already in use, and the sign-in pages of a Mock SSO test must be answered there. Stop what uses it, or set another port under "Address of this app as the workers' browsers see it" (for example http://127.0.0.1:8790).`));
+    });
+    srv.listen(port, '127.0.0.1', () => resolve(srv));
+  });
 }
 
 // ---- one page: waiting until it has gone quiet ---------------------------
@@ -522,12 +622,18 @@ async function endRun() {
   for (const v of run.vus.values()) v.stopped = true;
   await Promise.race([Promise.all([...run.vus.values()].map((v) => v.task)), sleep(8000)]);
   if (run.browser) await run.browser.close().catch(() => {});
+  if (relay) { const r = relay; relay = null; await new Promise((s) => { r.close(() => s()); if (r.closeAllConnections) r.closeAllConnections(); }); }
 }
 async function reconcile() {
   if (current && (desired.state === 'stopped' || desired.state === 'idle' || desired.runId !== current.runId)) await endRun();
   if (!desired.runId || !['running', 'paused'].includes(desired.state)) return;
   if (!current) {
     current = { runId: desired.runId, cfg: desired.config, vus: new Map(), errorShots: 0, browser: null };
+    const port = relayWanted(current.cfg);
+    if (port && !relay) try { relay = await startRelay(port); } catch (err) {   // null: another worker here already answers
+      out.fatal = String(err.message || err);
+      current = null; await sleep(5000); return;
+    }
     if (current.cfg.type !== 'api') try { current.browser = await launch(current.cfg); } catch (err) {
       // Nothing can run without a browser: tell the controller, which ends the run with this reason.
       out.fatal = `No browser could be started on this worker. ${err.message}`;
@@ -553,12 +659,11 @@ async function sync() {
     activity: current ? [...current.vus.values()].slice(0, 120).map((v) => ({ id: v.spec.id, user: v.spec.user, at: v.at, since: v.since, last: v.last, done: !!v.done })) : [],
   };
   try {
-    const r = await fetch(`${CONTROLLER}/w/sync`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Worker-Token': TOKEN },
-      body: JSON.stringify(body), signal: AbortSignal.timeout(20000),
-    });
-    if (r.status === 401) { console.error('worker: the controller refused the token'); process.exit(2); }
-    desired = await r.json();
+    const r = await talk('POST', '/w/sync', { 'Content-Type': 'application/json', 'X-Worker-Token': TOKEN }, JSON.stringify(body));
+    if (r.status === 401) { console.error('worker: the controller refused the token. Copy it again from Administration > Capacity and workers.'); process.exit(2); }
+    if (r.status !== 200) throw new Error(`the controller answered HTTP ${r.status} - is ${CONTROLLER} the address of the load test app?`);
+    desired = JSON.parse(r.body.toString());
+    if (!sync.connected) { sync.connected = true; console.log(`worker ${NAME}: connected to ${CONTROLLER}`); }
     out.fatal = '';
     sync.failures = 0;
   } catch (err) {
@@ -566,12 +671,18 @@ async function sync() {
     // for a minute stops loading the instance.
     out.samples.unshift(...body.samples); out.shots.unshift(...body.shots); out.finished.unshift(...body.finished);
     sync.failures = (sync.failures || 0) + 1;
+    // Said at once, and again every half minute: a worker that cannot reach its controller must not sit there mute.
+    if (sync.failures === 1 || sync.failures % 30 === 0) console.error(`worker ${NAME}: cannot reach the controller - ${whyNot(err)}`);
+    sync.connected = false;
     if (sync.failures === 60) { desired = { state: 'stopped' }; if (LOCAL) { await endRun(); process.exit(0); } }
   }
 }
 
 async function main() {
-  if (!TOKEN) { console.error('worker: --token (or UILOAD_WORKER_TOKEN) is required'); process.exit(2); }
+  if (!TOKEN && TOKEN_FILE) try { TOKEN = fs.readFileSync(TOKEN_FILE, 'utf8').trim(); } catch (err) { console.error(`worker: the token file ${TOKEN_FILE} cannot be read (${err.code || err.message})`); process.exit(2); }
+  if (!TOKEN) { console.error('worker: the worker token is required: --token-file <file> (UILOAD_WORKER_TOKEN_FILE) or --token (UILOAD_WORKER_TOKEN). It is shown under Administration > Capacity and workers.'); process.exit(2); }
+  if (CA_FILE && !fs.existsSync(CA_FILE)) { console.error(`worker: the certificate file ${CA_FILE} does not exist`); process.exit(2); }
+  if (INSECURE && CONTROLLER.startsWith('https:')) console.error('worker: --insecure: the controller\'s certificate is NOT checked. For a lab only.');
   console.log(`worker ${NAME}: controller ${CONTROLLER}, up to ${CAPACITY} users`);
   const bye = async () => { await endRun(); process.exit(0); };
   process.on('SIGTERM', bye); process.on('SIGINT', bye);
@@ -584,4 +695,4 @@ async function main() {
 }
 
 if (require.main === module) main();
-module.exports = { watch, quiet, LOGIN_PATH };
+module.exports = { watch, quiet, LOGIN_PATH, whyNot, relayWanted };
