@@ -1,0 +1,19 @@
+{
+  "name": "sn-ui-load-test",
+  "version": "1.0.0",
+  "description": "Browser load test for a ServiceNow instance: temporary users, a mock SSO identity provider for them only, chained links, parallel Playwright workers, and full cleanup on stop.",
+  "private": true,
+  "license": "UNLICENSED",
+  "main": "src/server.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.js",
+    "worker": "node src/worker.js",
+    "test": "node --test",
+    "deps:age": "node scripts/check-release-age.js --update",
+    "deps:check": "node scripts/check-release-age.js --offline"
+  },
+  "dependencies": {
+    "playwright-core": "1.65.1"
+  }
+}

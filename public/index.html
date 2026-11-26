@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ServiceNow Load Test</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form class="login-card" id="loginForm">
+    <div class="brand big"><span class="logo">LT</span><div><b>ServiceNow Load Test</b><small>Sign in to continue</small></div></div>
+    <label>User name <input name="user" autocomplete="username" autofocus></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password"></label>
+    <button class="btn primary wide">Sign in</button>
+    <p class="err" id="loginErr"></p>
+  </form>
+</div>
+
+<div id="app" class="shell hidden">
+  <aside class="side">
+    <div class="brand"><span class="logo">LT</span><div><b>Load Test</b><small id="sideInstance">no instance set</small></div></div>
+    <nav id="nav">
+      <a href="#/overview" data-r="overview"><i>◧</i>Overview</a>
+      <div class="group">Tests</div>
+      <a href="#/tests" data-r="tests" class="sub"><i>☰</i>All tests</a>
+      <a href="#/tests/new" data-r="tests/new" class="sub"><i>＋</i>New test</a>
+      <div class="group">Runs</div>
+      <a href="#/run" data-r="run" class="sub"><i>▶</i>Live run <span id="liveDot" class="dot hidden"></span></a>
+      <a href="#/history" data-r="history" class="sub"><i>◷</i>History</a>
+      <div class="group">ServiceNow</div>
+      <a href="#/sn/connection" data-r="sn/connection" class="sub admin"><i>⇄</i>Instances</a>
+      <a href="#/sn/records" data-r="sn/records" class="sub"><i>▤</i>Records on the instance <span id="recBadge" class="badge hidden"></span></a>
+      <div class="group">Administration</div>
+      <a href="#/admin/capacity" data-r="admin/capacity" class="sub admin"><i>⚙</i>Capacity and workers</a>
+      <a href="#/admin/people" data-r="admin/people" class="sub admin"><i>☺</i>People</a>
+      <a href="#/account" data-r="account" class="sub"><i>🔑</i>My account</a>
+    </nav>
+    <div class="side-foot"><span id="whoami"></span><button id="logout" class="link">Sign out</button></div>
+  </aside>
+  <div class="main">
+    <div id="defaultPw" class="bar hidden">You are still using the default password. Change it under <a href="#/account">My account</a>.</div>
+    <div id="view" class="view"></div>
+  </div>
+</div>
+
+<div id="lightbox" class="hidden"><img alt=""><p></p></div>
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>
