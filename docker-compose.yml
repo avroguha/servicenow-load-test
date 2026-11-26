@@ -1,0 +1,70 @@
+# One command per place - the env file names everything that differs between them:
+#
+#   docker compose --env-file work.env up --build -d     # office
+#   docker compose --env-file home.env up --build -d     # home lab
+#
+# Every location is REQUIRED from the env file (the question-mark form): an unset one stops
+# the command with a message; an empty one is honoured (that is how home.env
+# says "no proxy"). Nothing here falls back to a public registry.
+# A registry token is given in the shell for one command, never in a file:
+#   NPM_TOKEN=... docker compose --env-file work.env up --build -d
+
+x-build: &build
+  context: .
+  args:
+    IMAGE_REGISTRY: ${IMAGE_REGISTRY?set IMAGE_REGISTRY in the env file - the site registry prefix with its trailing slash, or empty}
+    IMAGE_PLAYWRIGHT: ${IMAGE_PLAYWRIGHT?set IMAGE_PLAYWRIGHT in the env file - registry path of the Playwright image, without tag}
+    NPM_REGISTRY: ${NPM_REGISTRY?set NPM_REGISTRY in the env file}
+    NPM_TOKEN: ${NPM_TOKEN-}
+    CA_BUNDLE_B64: ${CA_BUNDLE_B64?set CA_BUNDLE_B64 in the env file - leave it empty unless the proxy intercepts TLS}
+    HTTP_PROXY: ${HTTP_PROXY?set HTTP_PROXY in the env file - empty for none}
+    HTTPS_PROXY: ${HTTPS_PROXY?set HTTPS_PROXY in the env file - empty for none}
+    NO_PROXY: ${NO_PROXY?set NO_PROXY in the env file}
+
+services:
+  # Runs first on every `up`, as root, with no network: makes the state folders
+  # and gives them to the app's user. A bind-mounted folder is created by Docker
+  # as root, and a certificate copied in by someone else is owned by them - the
+  # unprivileged app could read neither without this.
+  init:
+    image: sn-load-test:local
+    build: *build
+    pull_policy: build
+    user: "0:0"
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    command: ["sh", "-c", "mkdir -p /state/data /state/certs && chown -R 1000:1000 /state && chmod 700 /state/data"]
+    volumes:
+      - ${STATE_DIR?set STATE_DIR in the env file - the folder that keeps settings, results and the certificate}:/state
+    restart: "no"
+
+  app:
+    image: sn-load-test:local
+    build: *build
+    pull_policy: build
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    init: true                     # reaps the browser processes the workers start
+    # Published ports, not host networking: the app runs as an unprivileged user
+    # and cannot bind 443 or 80 itself (added capabilities do not survive the
+    # USER switch, and no-new-privileges blocks the file-capability route). It
+    # listens on 8443 / 8081 and Docker publishes them. Do not "fix" this to
+    # network_mode: host.
+    ports:
+      - "${HTTPS_PORT?set HTTPS_PORT in the env file - usually 443}:8443"
+      - "${HTTP_PORT?set HTTP_PORT in the env file - usually 80; it only redirects to HTTPS}:8081"
+    environment:
+      UILOAD_PUBLIC_HOST: ${PUBLIC_HOST?set PUBLIC_HOST in the env file - the name or address people type}
+      UILOAD_PUBLIC_HTTPS_PORT: ${HTTPS_PORT?set HTTPS_PORT in the env file}
+      UILOAD_TLS_NAMES: ${TLS_NAMES?set TLS_NAMES in the env file - more names for the first self-signed certificate, or empty}
+    volumes:
+      - ${STATE_DIR?set STATE_DIR in the env file}:/state
+    shm_size: "1gb"                # browsers
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # Stopping during a run ends the load and removes the run's records from ServiceNow first.
+    stop_grace_period: 200s

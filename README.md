@@ -34,9 +34,8 @@ installed, or Playwright's own Chromium (`npx playwright-core install
 chromium`). `UILOAD_PORT`, `UILOAD_HOST` (default `127.0.0.1`) and `UILOAD_DATA`
 (default `./data`) change the defaults.
 
-Home lab: `bash deploy/lab/redeploy.sh` installs it on `avro@192.168.5.46` as a
-systemd service (`uiload`), without Docker; the app is then at
-`http://192.168.5.46:8787`.
+That is the way to try it on one machine. To run it for a team, see
+**Deploying with Docker** below: HTTPS on 443, one command.
 
 ## The menu
 
@@ -143,17 +142,108 @@ refused, the Instances page lists the causes to check, most likely first.
   browser's load event.
 - A brand-new user's first sign-in is slower than a returning user's.
 
+## Deploying with Docker
+
+One command per place; the env file names everything that differs:
+
+```
+docker compose --env-file work.env up --build -d     # office
+docker compose --env-file home.env up --build -d     # home lab
+```
+
+The app is then on **https://<PUBLIC_HOST>** (port 443; port 80 only redirects).
+Sign in `admin` / `admin` and change the password.
+
+### At the office: what to set in work.env
+
+`work.env` in this repository holds placeholders. On the work machine put the
+site's real values in, and keep that edit out of git
+(`git update-index --skip-worktree work.env`).
+
+| Key | What it is |
+|---|---|
+| `IMAGE_REGISTRY` | the site's registry prefix for Docker Hub images, with the trailing slash |
+| `IMAGE_PLAYWRIGHT` | where the site's registry serves the Playwright image from, **without tag** (the Dockerfile pins tag and digest) |
+| `NPM_REGISTRY` | the site's npm mirror |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | the proxy for the build |
+| `CA_BUNDLE_B64` | empty, unless the proxy intercepts TLS: then `base64 -w0 site-ca.pem` |
+| `STATE_DIR` | the folder that keeps settings, results and the certificate (default `../uiload-state`, beside the project, so replacing the code never touches it) |
+| `PUBLIC_HOST` | the name people type in the browser |
+| `TLS_NAMES` | more names for the first, self-signed certificate; may be empty |
+| `HTTPS_PORT`, `HTTP_PORT` | 443 and 80 |
+
+Every key must be present in the file, even when empty: a missing one stops
+`docker compose` with a message naming it. A registry token is never written
+down - give it for the one command:
+`NPM_TOKEN=... docker compose --env-file work.env up --build -d`. The image is
+built and used on that host; do not push an image built with a token to a
+registry (build arguments stay readable in an image's history).
+
+The build proxy is not the proxy tests use. How a **test** reaches a ServiceNow
+instance is set in the app (ServiceNow > Instances > Proxies), per instance and
+per test.
+
+What the build does: pulls the pinned Playwright image (Ubuntu 24.04 with Node
+and Chromium - no browser download, no system packages), runs `npm ci` against
+the mirror, and refuses any package published in the last 72 hours using the
+committed publish-time record (no registry lookup). It works on the legacy
+builder; buildx is not needed.
+
+### HTTPS and the certificate
+
+- The app always serves HTTPS. On first start with no certificate it makes a
+  self-signed one for `PUBLIC_HOST`, `TLS_NAMES`, localhost - browsers warn
+  until a real one is installed.
+- To install the company certificate: download it as a **PEM bundle** (private
+  key with a password, plus the certificate chain) or a **PFX**, then
+
+  ```
+  bash scripts/install-cert.sh my-download.pfx --host loadtest.avro.com
+  ```
+
+  It asks for the key's password (not echoed, never on a command line), finds
+  the server certificate by matching it to the key, orders the chain, leaves the
+  root out, checks the name and the expiry, backs up the old pair, and puts
+  `tls.crt` and `tls.key` into `STATE_DIR/certs`. **The app switches to the new
+  certificate within a minute, without a restart.** If the new pair is unusable
+  the old one keeps serving and the log says why.
+- `bash scripts/test-install-cert.sh` tests that script against made-up
+  certificates (run it on Linux).
+
+### How it runs
+
+- As an unprivileged user (uid 1000), all capabilities dropped. It cannot bind
+  443 itself, so it listens on 8443 / 8081 and Docker publishes them - that is
+  why it does not use host networking.
+- A one-shot `init` step runs first on every `up`, as root with no network, and
+  gives `STATE_DIR` to that user; a certificate copied in by someone else
+  becomes readable that way.
+- The plain-HTTP port (8787) stays inside the container: the app's own workers,
+  the health check and the mock sign-in pages use it.
+- `docker compose ... down` during a run stops the load and removes the run's
+  records from ServiceNow first (up to 200 s).
+- Without Docker, the app refuses to serve plain HTTP on a network address
+  unless `UILOAD_CERTS` names a certificate folder (HTTPS) or
+  `UILOAD_PLAIN_HTTP=1` says a TLS proxy stands in front.
+
+### Updating, and moving between home and work
+
+Move git, not folders: `git pull` (or a bundle) on the host, then the same
+`docker compose ... up --build -d`. `STATE_DIR` is outside the code folder.
+`bash scripts/push-to-host.sh user@host home.env` does copy-and-up for the lab.
+
 ## Tests
 
 ```
 npm test
 ```
 
-35 tests, no network: the SAML signature (also checked once against
+47 tests, no network: the SAML signature (also checked once against
 `xmlsec1`), the mock sign-in's refusals, checks / creation / cleanup against an
 in-memory instance for every sign-in method, load patterns, limits, the
-two-hour rule, the proxy tunnel, the diagnosis rules, several instances, and
-the supply-chain gate. Every path above was also run against a developer
+two-hour rule, the proxy tunnel, the diagnosis rules, several instances, the
+supply-chain gate, and the deployment files themselves (image pin, required
+locations, nothing of the build site in the image, HTTPS rules). Every path above was also run against a developer
 instance on the Brazil release.
 
 ## Layout
@@ -168,5 +258,7 @@ src/http.js       requests, directly or through a proxy
 src/sn.js         the REST client for one instance
 src/saml.js, x509.js, idp.js   the mock single sign-on
 public/           the page
-deploy/lab/       install on the home-lab container
+src/tls.js        the HTTPS certificate: self-signed at first start, reloaded when replaced
+Dockerfile, docker-compose.yml, work.env, home.env, image-pins.json   the deployment
+scripts/install-cert.sh, test-install-cert.sh, push-to-host.sh
 ```

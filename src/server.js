@@ -3,7 +3,15 @@
 // and the mock identity provider, on one port.
 //
 //   UILOAD_HOST (default 127.0.0.1), UILOAD_PORT (default 8787), UILOAD_DATA (default ./data)
+//
+// HTTPS: set UILOAD_CERTS to a folder (tls.crt, tls.key; a self-signed pair is made when it
+// is empty). The app then serves HTTPS on UILOAD_HTTPS_PORT (8443) for people, redirects
+// plain HTTP on UILOAD_REDIRECT_PORT (8081), and keeps UILOAD_PORT on loopback only, for its
+// own workers, the health check and the mock sign-in pages. Without UILOAD_CERTS it serves
+// plain HTTP, and only on loopback unless UILOAD_PLAIN_HTTP=1 says a TLS proxy stands in front.
 const http = require('node:http');
+const https = require('node:https');
+const tlsFiles = require('./tls');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -16,6 +24,10 @@ const { Controller, normalize, validate, plan, cleanStored, janitor, records, li
 
 const HOST = process.env.UILOAD_HOST || '127.0.0.1';
 const PORT = Number(process.env.UILOAD_PORT) || 8787;
+const CERTS = process.env.UILOAD_CERTS || '';
+const HTTPS_PORT = Number(process.env.UILOAD_HTTPS_PORT) || 8443;
+const REDIRECT_PORT = Number(process.env.UILOAD_REDIRECT_PORT) || 8081;
+const PUBLIC_HTTPS_PORT = Number(process.env.UILOAD_PUBLIC_HTTPS_PORT) || 443;
 const PUBLIC = path.join(__dirname, '..', 'public');
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
 
@@ -108,7 +120,7 @@ async function api(req, res, url) {
     if (!store.read('auth.json', null) || !store.read('auth.json', {}).users) saveAccounts(accounts());
     const sid = crypto.randomBytes(24).toString('hex');
     sessions.set(sid, { name, exp: Date.now() + 12 * 3600e3 });
-    return send(res, 200, { ok: true }, { 'Set-Cookie': `uiload_sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200` });
+    return send(res, 200, { ok: true }, { 'Set-Cookie': `uiload_sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200${req.socket.encrypted ? '; Secure' : ''}` });
   }
   const me = who(req);
   if (p === '/api/me') return send(res, 200, me ? { signedIn: true, name: me.name, role: me.role, defaultPassword: me.isDefault } : { signedIn: false });
@@ -248,9 +260,10 @@ async function api(req, res, url) {
   return send(res, 404, { error: 'Not found.' });
 }
 
-const server = http.createServer(async (req, res) => {
+async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
+    if (url.pathname === '/healthz') return send(res, 200, 'ok');
     if (url.pathname === '/idp/sso') {
       const params = req.method === 'POST' ? new URLSearchParams(await readBody(req, 1e6)) : url.searchParams;
       return idp.handleSso(req, res, params);
@@ -270,7 +283,8 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     return send(res, err instanceof SyntaxError ? 400 : 500, { error: err.message });
   }
-});
+}
+const server = http.createServer(handle);
 
 // Ctrl+C during a run: stop the load and clean the instance before leaving.
 let leaving = false;
@@ -291,6 +305,28 @@ if (require.main === module) {
   saveAccounts(accounts());
   setTimeout(sweep, 20000).unref();
   setInterval(sweep, 5 * 60000).unref();
-  server.listen(PORT, HOST, () => console.log(`ServiceNow load test: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}  (sign in: admin / admin until changed)`));
+  const loopback = ['127.0.0.1', 'localhost', '::1'].includes(HOST);
+  if (CERTS) {
+    const names = [process.env.UILOAD_PUBLIC_HOST, ...String(process.env.UILOAD_TLS_NAMES || '').split(',')].map((n) => String(n || '').trim()).filter(Boolean);
+    tlsFiles.ensure(CERTS, names);
+    const pair = tlsFiles.read(CERTS);
+    const secure = https.createServer({ cert: pair.cert, key: pair.key }, handle);
+    tlsFiles.watch(CERTS, secure, pair);
+    secure.listen(HTTPS_PORT, loopback ? '0.0.0.0' : HOST, () => console.log(`ServiceNow load test: https on port ${HTTPS_PORT} (certificate: ${pair.subject}, valid to ${pair.validTo}); sign in admin / admin until changed`));
+    // Plain HTTP only sends people to HTTPS.
+    http.createServer((req, res) => {
+      const host = String(req.headers.host || process.env.UILOAD_PUBLIC_HOST || 'localhost').replace(/:\d+$/, '');
+      res.writeHead(301, { Location: `https://${host}${PUBLIC_HTTPS_PORT === 443 ? '' : `:${PUBLIC_HTTPS_PORT}`}${req.url}` });
+      res.end();
+    }).listen(REDIRECT_PORT, loopback ? '0.0.0.0' : HOST);
+    // The app's own workers, the health check and the mock sign-in pages stay on this machine.
+    server.listen(PORT, '127.0.0.1');
+  } else {
+    if (!loopback && process.env.UILOAD_PLAIN_HTTP !== '1') {
+      console.error('Refusing to serve plain HTTP on a network address. Set UILOAD_CERTS to a folder for HTTPS, or UILOAD_PLAIN_HTTP=1 when a TLS-terminating proxy stands in front.');
+      process.exit(1);
+    }
+    server.listen(PORT, HOST, () => console.log(`ServiceNow load test: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}  (sign in: admin / admin until changed)`));
+  }
 }
 module.exports = { server, ctl };
