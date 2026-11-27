@@ -217,7 +217,14 @@ test('a test browser arriving through a link is taken to the test identity provi
   assert.match(fn, /if \(!visited && home\(\)\)/);
   assert.match(fn, /if \(!there\(\) && home\(\)\) r = await page\.goto\(target/);
   // Watching navigations switches the cache off, so it is always removed again.
-  assert.match(fn, /finally \{[\s\S]*page\.unroute\(match, divert\)/);
+  assert.match(fn, /page\.unroute\(match, divert\)/); assert.match(fn, /finally \{[\s\S]*await unwatch\(\)/);
+  // Every sign-in is watched - a returning browser's and "Sign in first" too. ServiceNow has been seen to honour
+  // the run's provider on a browser's first visit and choose its own on the next. The company page is never opened.
+  assert.match(fn, /const guard = true;/);
+  assert.match(fn, /route\.abort\('blockedbyclient'\)/);
+  assert.ok(!/return route\.continue\(\);\s*\n\s*diverted \+= 1;[\s\S]*diverted >= 2/.test(fn));
+  assert.match(fn, /clearCookies\(\{ domain: new URL\(cfg\.origin\)\.hostname \}\)/, 'a retry starts on a new connection');
+  assert.match(w, /if \(cfg\.authMode === 'sso'\) return this\.arriveBySso\(null, deadline\)/);
   assert.match(w, /if \(viaLink && cfg\.authMode === 'sso'\) status = await this\.arriveBySso\(url, deadline\)/);
 });
 

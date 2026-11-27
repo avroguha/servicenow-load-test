@@ -278,7 +278,9 @@ class VU {
     const cfg = this.run.cfg;
     let u;
     try { u = new URL(this.page.url()); } catch { return ''; }
-    if (u.origin !== cfg.origin) return `left the instance: ${u.origin}${u.pathname}`;
+    if (u.origin !== cfg.origin) return cfg.authMode === 'sso' && this.signedIn
+      ? `the session was lost: ServiceNow sent the browser to its own sign-on page (${u.origin}). The user signs in again at the test identity provider.`
+      : `left the instance: ${u.origin}${u.pathname}`;
     if (LOGIN_PATH.test(u.pathname)) return `not signed in (landed on ${u.pathname})`;
     try {
       if (await within(this.page.locator('input[name="user_password"]').count(), 5000, 'reading the page')) return 'not signed in (the login page was shown)';
@@ -319,11 +321,8 @@ class VU {
   async signIn(shot) {
     const cfg = this.run.cfg;
     const page = this.page;
-    const s = await this.measured(-1, cfg.authMode === 'sso' ? 'Sign in (SSO)' : 'Sign in (local)', async () => {
-      if (cfg.authMode === 'sso') {
-        const r = await page.goto(`${cfg.origin}/login_with_sso.do?glide_sso_id=${cfg.ssoId}`, { waitUntil: 'load', timeout: cfg.timeoutMs });
-        return r ? r.status() : 0;
-      }
+    const s = await this.measured(-1, cfg.authMode === 'sso' ? 'Sign in (SSO)' : 'Sign in (local)', async (deadline) => {
+      if (cfg.authMode === 'sso') return this.arriveBySso(null, deadline);
       await page.goto(`${cfg.origin}/login.do`, { waitUntil: 'load', timeout: cfg.timeoutMs });
       await page.fill('#user_name', this.spec.user);
       await page.fill('#user_password', this.spec.password);
@@ -387,25 +386,52 @@ class VU {
       const q = route.request();
       let top = false;
       try { top = q.isNavigationRequest() && q.frame() === page.mainFrame(); } catch { /* no frame */ }
-      if (!top || diverted >= 2) return route.continue();
+      if (!top) return route.continue();
       diverted += 1;
       if (!this.run.divertedFrom) {
         this.run.divertedFrom = new URL(q.url()).origin;
         out.log.push(`This instance sends arriving browsers to its own sign-on page (${this.run.divertedFrom}). Test browsers are taken to the test identity provider instead; that page is never opened.`);
       }
+      if (diverted > 4) {
+        // Four times asked for the test identity provider, four times sent away. The company's page is not opened: the request ends here.
+        blockedAt = new URL(q.url()).origin;
+        return route.abort('blockedbyclient');
+      }
+      if (diverted > 1) {
+        // ServiceNow was asked for the run's provider and still chose its own. One application node may not know
+        // the new record yet, and the browser is tied to that node by a cookie: wait, drop the instance's cookies
+        // so the next request can land elsewhere, and ask again.
+        this.run.retried = (this.run.retried || 0) + 1;
+        if (this.run.retried === 1) out.log.push(`ServiceNow sent a test browser to ${new URL(q.url()).origin} although it was asked for the test identity provider. Trying again on a new connection (up to 3 times, with a pause).`);
+        await sleep([0, 1000, 3000, 6000][diverted - 1]);
+        await this.ctx.clearCookies({ domain: new URL(cfg.origin).hostname }).catch(() => {});
+      }
       return route.fulfill({ status: 302, headers: { location: sso }, body: '' });
     };
-    // Watching navigations switches the browser cache off while it lasts. A new
-    // window has no cache to lose; a returning one is watched only on an
-    // instance that has been seen to send browsers elsewhere.
-    const guard = this.cold || !!this.run.divertedFrom;
-    if (guard) await page.route(match, divert);
+    let blockedAt = '';
+    const refusedMsg = () => `ServiceNow sent the browser to its own sign-on page (${blockedAt}) every time, also when asked 4 times for the test identity provider. That page was not opened. Open the identity provider record of this run on the instance while it is running and check it is active.`;
+    // Every sign-in is watched, a returning browser's too: ServiceNow has been seen to honour the run's provider
+    // on a browser's first visit and choose its own on the next. Watching navigations switches the browser
+    // cache off while it lasts, so it ends the moment the browser is back on the instance from the test
+    // provider - the page's own files then come from the cache as they would for a person.
+    const guard = true;
+    await page.route(match, divert);
+    let watching = true;
+    const unwatch = async () => { if (!watching) return; watching = false; await page.unroute(match, divert).catch(() => {}); };
     let visited = false;                 // has this browser been to the test identity provider?
-    const seen = (f) => { try { if (f === page.mainFrame() && new URL(f.url()).origin === idpOrigin) visited = true; } catch { /* no url */ } };
+    const seen = (f) => {
+      try {
+        if (f !== page.mainFrame()) return;
+        const o = new URL(f.url()).origin;
+        if (o === idpOrigin) visited = true;
+        else if (visited && o === cfg.origin) unwatch();
+      } catch { /* no url */ }
+    };
     page.on('framenavigated', seen);
     try {
-      const withId = `${target}${target.includes('?') ? '&' : '?'}glide_sso_id=${cfg.ssoId}`;
-      let r = await page.goto(withId, { waitUntil: 'domcontentloaded', timeout: cfg.timeoutMs });
+      const first = target ? `${target}${target.includes('?') ? '&' : '?'}glide_sso_id=${cfg.ssoId}` : sso;
+      let r;
+      try { r = await page.goto(first, { waitUntil: 'domcontentloaded', timeout: cfg.timeoutMs }); } catch (err) { if (blockedAt) throw new Error(refusedMsg()); throw err; }
       if (!guard && foreign(page.url())) {
         // First seen on a returning browser: sign in at the test provider, then open the link.
         this.run.divertedFrom = new URL(page.url()).origin;
@@ -413,19 +439,21 @@ class VU {
         await page.goto(sso, { waitUntil: 'domcontentloaded', timeout: cfg.timeoutMs });
         diverted = 1;
       }
-      const want = new URL(target);
+      const want = new URL(target || cfg.origin);
       const there = () => { try { const u = new URL(page.url()); return u.origin === cfg.origin && u.pathname === want.pathname && [...want.searchParams].every(([k, v]) => u.searchParams.get(k) === v); } catch { return false; } };
       // On the instance, and not on one of the pages a sign-in only passes through.
       const home = () => { try { const u = new URL(page.url()); return u.origin === cfg.origin && !/\/(navpage|login_with_sso|auth_redirect|login_redirect)\.do$/i.test(u.pathname); } catch { return false; } };
       let still = 0; let last = '';
-      if (!diverted) {
+      if (!diverted && target) {
         // Some links start no sign-in at all: a portal page open to guests, or
         // the login page. If the browser rests on the instance without having
         // been to the test identity provider, take it there.
         while (Date.now() < deadline && !visited) {
           const now = page.url();
           still = now === last && home() ? still + 1 : 0; last = now;
-          if (still >= 8) break;
+          // Decided quickly (0.3 s): waiting longer lets the page start a sign-in of its own that then races this one,
+          // and ServiceNow rejects the answer to whichever request it did not keep ("No valid SubjectConfirmation").
+          if (still >= 2) break;
           await sleep(150);
         }
         if (!visited && home()) {
@@ -435,7 +463,8 @@ class VU {
         }
         still = 0; last = '';
       }
-      if (diverted) {
+      if (blockedAt) throw new Error(refusedMsg());
+      if (diverted && target) {
         // The sign-in ends back on the instance. If ServiceNow did not keep the link, open it now.
         while (Date.now() < deadline && !there()) {
           const now = page.url();
@@ -445,10 +474,11 @@ class VU {
         }
         if (!there() && home()) r = await page.goto(target, { waitUntil: 'domcontentloaded', timeout: cfg.timeoutMs });
       }
+      if (blockedAt) throw new Error(refusedMsg());
       return r ? r.status() : 0;
     } finally {
       page.off('framenavigated', seen);
-      if (guard) await page.unroute(match, divert).catch(() => {});
+      await unwatch();
     }
   }
 
