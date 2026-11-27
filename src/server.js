@@ -20,7 +20,7 @@ const { SN } = require('./sn');
 const { maskProxy } = require('./http');
 const { connectionHints } = require('./diagnose');
 const idp = require('./idp');
-const { Controller, normalize, validate, plan, cleanStored, janitor, records, limits, MAX_RUN_MS } = require('./run');
+const { Controller, normalize, validate, plan, cleanStored, janitor, records, limits, recordingOf, MAX_RUN_MS } = require('./run');
 
 const HOST = process.env.UILOAD_HOST || '127.0.0.1';
 const PORT = Number(process.env.UILOAD_PORT) || 8787;
@@ -191,7 +191,7 @@ async function api(req, res, url) {
   }
 
   // ---- tests ----
-  if (p === '/api/scenarios' && m === 'GET') return send(res, 200, store.scenarios().map((s) => normalize(s)));
+  if (p === '/api/scenarios' && m === 'GET') return send(res, 200, store.scenarios().map((s) => { const sc = normalize(s); const rec = recordingOf(sc); return { ...sc, recorded: rec ? { at: rec.at, requests: rec.requests, data: rec.data, visitSeconds: rec.visitSeconds } : null }; }));
   if (p === '/api/scenarios' && m === 'PUT') {
     const b = await json(req);
     const sc = normalize(b);

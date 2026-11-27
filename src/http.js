@@ -53,7 +53,7 @@ function viaProxy({ method, url, headers, body, timeoutMs, proxy, insecure }) {
     const req = mod.request(opts, (res) => {
       const parts = [];
       res.on('data', (c) => parts.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(parts).toString('utf8') }));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, setCookies: res.headers['set-cookie'] || [], text: Buffer.concat(parts).toString('utf8') }));
       res.on('error', reject);
     });
     req.setTimeout(timeoutMs, () => { const e = new Error('no answer within the time limit'); e.name = 'TimeoutError'; req.destroy(e); });
@@ -63,11 +63,11 @@ function viaProxy({ method, url, headers, body, timeoutMs, proxy, insecure }) {
   });
 }
 
-// -> { status, headers, text }. Redirects are not followed.
+// -> { status, headers, setCookies, text }. Redirects are not followed.
 async function request({ method = 'GET', url, headers = {}, body, timeoutMs = 60000, proxy = '', insecure = false }) {
   if (proxy) return viaProxy({ method, url, headers, body, timeoutMs, proxy, insecure });
   const r = await fetch(url, { method, headers, body, redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
-  return { status: r.status, headers: Object.fromEntries(r.headers), text: await r.text() };
+  return { status: r.status, headers: Object.fromEntries(r.headers), setCookies: r.headers.getSetCookie ? r.headers.getSetCookie() : [], text: await r.text() };
 }
 
 // What an administrator typed as a proxy: '' when it is not a usable address.

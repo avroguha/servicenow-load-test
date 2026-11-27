@@ -13,6 +13,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
 const { request } = require('./http');
+const replay = require('./replay');
 
 const arg = (flag, env, dflt) => {
   const i = process.argv.indexOf(flag);
@@ -35,7 +36,7 @@ const BODY_GRACE_MS = 3000;
 const REFUSAL = /You do not have sufficient privileges[^\n.]*|Security constraints prevent access[^\n.]*|Record not found|Page not found|Not Authorized|Access Denied|Knowledge record not found/i;
 const LOGIN_PATH = /\/(login|logout|external_logout_complete|auth_redirect|login_with_sso|login_locate_sso|sso_login)\b/i;
 
-const out = { samples: [], shots: [], traces: [], finished: [], log: [] };
+const out = { samples: [], shots: [], traces: [], finished: [], log: [], recording: [] };
 let desired = { state: 'idle' };
 let current = null;            // { runId, cfg, browser, vus: Map, errorShots }
 let lastCpu = null;
@@ -100,7 +101,7 @@ function whyNot(err) {
 // the controller's certificate.
 let relay = null;
 function relayWanted(cfg) {
-  if (cfg.type === 'api' || cfg.authMode !== 'sso') return 0;
+  if (cfg.type !== 'ui' || cfg.authMode !== 'sso') return 0;
   try {
     const u = new URL(cfg.idpBaseUrl);
     if (!['127.0.0.1', 'localhost'].includes(u.hostname) || u.protocol !== 'http:') return 0;   // the browsers reach the app directly
@@ -148,7 +149,7 @@ function startRelay(port) {
 // the content is fetched. A step ends when no request has been in flight for
 // `quietMs` (long-lived channels such as /amb are not counted).
 function watch(page) {
-  const w = { inflight: new Map(), lastChange: Date.now(), serverErrors: 0, requests: 0, path: [] };
+  const w = { inflight: new Map(), lastChange: Date.now(), serverErrors: 0, requests: 0, path: [], rec: null, origin: '' };
   const skip = (r) => LONG_LIVED.test(r.url()) || ['websocket', 'eventsource'].includes(r.resourceType());
   page.on('request', (r) => { if (skip(r)) return; w.inflight.set(r, 0); w.requests += 1; w.lastChange = Date.now(); });
   const done = (r) => { if (w.inflight.delete(r)) w.lastChange = Date.now(); };
@@ -156,6 +157,17 @@ function watch(page) {
   page.on('requestfailed', done);
   page.on('response', (r) => {
     if (r.status() >= 500) w.serverErrors += 1;
+    // A test run records what each step asks the instance for, so a load run can send it again without a browser.
+    if (w.rec && w.rec.length < 400) {
+      try {
+        const q = r.request(); const h = q.headers();
+        const post = q.postData();
+        if (!(post && /SAMLResponse=/.test(post))) {
+          const k = replay.keep({ method: q.method(), url: q.url(), resourceType: q.resourceType(), postData: post, headers: h, status: r.status() }, w.origin);
+          if (k) { if (h['x-usertoken']) k.token = h['x-usertoken']; w.rec.push(k); }
+        }
+      } catch { /* a request that has gone */ }
+    }
     // Every document the browser itself was sent to, in order: on a failed sign-in this is the story.
     try {
       const q = r.request();
@@ -232,12 +244,14 @@ class VU {
   }
 
   // Runs `fn`, waits for the page to settle, and reports one sample.
-  async measured(index, name, fn, { shot }) {
+  async measured(index, name, fn, { shot, arrival }) {
     const cfg = this.run.cfg;
     const w = this.w;
     const t0 = Date.now();
-    const s = { vu: this.spec.id, step: index, name, ok: true, t: t0, status: 0, error: '' };
+    // arrival: this step includes signing in - slower than any later step of the same person
+    const s = { vu: this.spec.id, step: index, name, ok: true, t: t0, status: 0, error: '', arrival: index < 0 || !!arrival };
     w.serverErrors = 0; w.requests = 0; w.lastChange = t0; w.path = [];
+    w.origin = cfg.origin; w.rec = cfg.record ? [] : null;
     this.at = name; this.since = t0;
     try {
       const status = await fn(t0 + cfg.timeoutMs);
@@ -262,6 +276,7 @@ class VU {
       try { s.cookies = (await within(this.ctx.cookies(cfg.origin), 4000, 'reading the cookies')).map((c) => c.name).slice(0, 14); } catch { /* the window is gone */ }
     }
     out.samples.push(s);
+    if (w.rec) { if (s.ok && index >= 0) out.recording.push({ index, name, ms: s.ms, requests: w.rec }); w.rec = null; }
     const wantShot = shot === 'all' || (!s.ok && this.run.errorShots < cfg.maxErrorShots);
     if (wantShot) {
       if (!s.ok) this.run.errorShots += 1;
@@ -361,7 +376,7 @@ class VU {
       } else throw new Error(`unknown step type "${st.type}"`);
       if (st.waitSelector) await this.appear(st.waitSelector, deadline);
       return status;
-    }, { shot });
+    }, { shot, arrival: viaLink });
     if (viaLink) this.signedIn = s.ok;
   }
 
@@ -493,7 +508,8 @@ class VU {
   async arrive() {
     const cfg = this.run.cfg;
     if (cfg.startAt) { this.doing('ready, waiting for the start'); while (Date.now() < cfg.startAt) { await this.gate(); await sleep(25); } return; }
-    if (cfg.iterations !== 1) await this.pause(Math.random() * Math.min(3000, cfg.thinkMs || 0));
+    // People do not arrive in the same instant unless that is the test: each new user starts somewhere in the first part of its level.
+    if (cfg.iterations !== 1) await this.pause(Math.random() * Math.max(Math.min(3000, cfg.thinkMs || 0), cfg.spreadMs || 0));
   }
 
   async loop() {
@@ -611,6 +627,185 @@ class ApiVU extends VU {
   }
 }
 
+// ---- one lightweight user: a recorded browser visit, sent again as plain HTTP ---
+// Signs in for real (ServiceNow builds its sign-in request, this app's identity
+// provider answers it, ServiceNow checks the answer and opens a session), then
+// sends what the browser sent for each step, with this user's own session and
+// token. No page is drawn: it measures how long ServiceNow takes to answer.
+const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+class HttpVU extends ApiVU {
+  constructor(run, spec) { super(run, spec); this.jar = new replay.Jar(); this.token = ''; this.cold = true; }
+
+  async send(method, url, headers, body) {
+    const cfg = this.run.cfg;
+    const h = { 'User-Agent': UA, ...headers };
+    const c = this.jar.header();
+    if (c) h.Cookie = c;
+    const r = await request({ method, url, headers: h, body, timeoutMs: cfg.timeoutMs, proxy: cfg.proxy });
+    this.jar.take(r.setCookies);
+    this.sent += 1;
+    if (r.status >= 500) this.server5xx += 1;
+    return r;
+  }
+
+  // Follows redirects inside the instance, as a browser would. Stops at a page, or when ServiceNow hands the
+  // browser to an identity provider - that address is returned, not opened.
+  async follow(method, url, headers, body) {
+    const cfg = this.run.cfg;
+    let m = method; let u = url; let b = body; let h = headers || { Accept: 'text/html,application/xhtml+xml,*/*;q=0.8' };
+    for (let hop = 0; hop < 10; hop += 1) {
+      const r = await this.send(m, u, h, b);
+      const loc = r.status >= 300 && r.status < 400 ? r.headers.location : '';
+      if (!loc) return { status: r.status, url: u, text: r.text, provider: '' };
+      const next = new URL(loc, u).href;
+      const provider = replay.providerUrl(next, u);
+      if (provider) return { status: r.status, url: next, text: '', provider };
+      if (new URL(next).origin !== cfg.origin) return { status: r.status, url: next, text: '', provider: next };   // sent straight to another site
+      m = 'GET'; u = next; b = undefined; h = { Accept: 'text/html,application/xhtml+xml,*/*;q=0.8' };
+    }
+    throw new Error('ServiceNow kept redirecting (10 times)');
+  }
+
+  // Arrives at `target` (or just signs in) with no session, through the run's identity provider.
+  async enter(target) {
+    const cfg = this.run.cfg;
+    const sso = `${cfg.origin}/login_with_sso.do?glide_sso_id=${cfg.ssoId}`;
+    const idpOrigin = new URL(cfg.idpBaseUrl).origin;
+    let why = '';
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      if (attempt) { this.jar.clear(); await this.pause([0, 1000, 3000, 6000][attempt]); }   // a new connection: another node may know the provider
+      let r = await this.follow('GET', target ? `${target}${target.includes('?') ? '&' : '?'}glide_sso_id=${cfg.ssoId}` : sso);
+      // A link that starts no sign-in (a portal page open to guests, the login page): ask for it.
+      if (!r.provider || new URL(r.provider).origin !== idpOrigin) r = await this.follow('GET', sso);
+      if (!r.provider) { why = 'ServiceNow did not start a single sign-on when asked for the test identity provider'; continue; }
+      const p = new URL(r.provider);
+      if (p.origin !== idpOrigin) { why = `ServiceNow chose its own sign-on page (${p.origin}) although it was asked for the test identity provider; that page was not opened`; continue; }
+      await this.send('GET', r.url, { Accept: 'text/html,*/*;q=0.8' });            // the redirect page a browser loads on the way
+      const a = await talk('GET', p.pathname + p.search, { Cookie: `uiload_idp=${this.spec.ticket}` }, null, cfg.timeoutMs);
+      if (a.status !== 200) throw new Error(`the test identity provider refused this user (HTTP ${a.status})`);
+      const form = replay.parseForm(a.body.toString());
+      if (!form || !form.fields.SAMLResponse) throw new Error('the test identity provider gave no sign-in answer');
+      r = await this.follow('POST', form.action, { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'text/html,*/*;q=0.8', Origin: idpOrigin }, new URLSearchParams(form.fields).toString());
+      if (r.provider || replay.isLoginPage(r.url, r.text)) { why = 'ServiceNow did not accept the sign-in answer'; continue; }
+      this.signedIn = true;
+      this.token = replay.findToken(r.text) || this.token;
+      if (target) {
+        const want = new URL(target); const got = new URL(r.url);
+        const there = got.pathname === want.pathname && [...want.searchParams].every(([k, v]) => got.searchParams.get(k) === v);
+        if (!there) { r = await this.follow('GET', target); this.token = replay.findToken(r.text) || this.token; }
+      }
+      return r;
+    }
+    throw new Error(`${why} (tried 4 times, each on a new connection)`);
+  }
+
+  // One timed step. `fn` returns { status, url, error }.
+  async timed(index, name, fn, arrival) {
+    const t0 = Date.now();
+    const s = { vu: this.spec.id, step: index, name, ok: true, t: t0, status: 0, error: '', url: '', arrival: index < 0 || !!arrival };
+    this.at = name; this.since = t0; this.sent = 0; this.server5xx = 0;
+    try {
+      const r = await fn();
+      s.status = r.status || 0; s.url = r.url || ''; s.error = r.error || '';
+      if (s.error) s.ok = false;
+    } catch (err) {
+      if (err === STOP) throw err;
+      s.ok = false;
+      s.error = err.name === 'TimeoutError' ? 'no answer within the time limit' : String((err.cause && err.cause.message) || err.message || err).split('\n')[0].slice(0, 300);
+    }
+    s.ms = Math.max(1, Date.now() - t0); s.requests = this.sent; s.serverErrors = this.server5xx;
+    this.last = { ok: s.ok, ms: s.ms };
+    out.samples.push(s);
+    if (!s.ok && this.run.errorShots < this.run.cfg.maxErrorShots) {
+      this.run.errorShots += 1;
+      out.traces.push({ vu: this.spec.id, user: this.spec.user, step: index, name, ok: false, ms: s.ms, status: s.status, url: s.url, error: s.error, t: Date.now(), bytes: 0, snippet: `${this.sent} request(s) sent in this step` });
+    }
+    return s;
+  }
+
+  // What the browser asked for in this step, asked again: six at a time, as a browser does.
+  async replayStep(index, skipPath) {
+    const cfg = this.run.cfg;
+    const list = replay.pick(cfg.recording, index, { cold: this.cold }).filter((q) => !(q.t === 'doc' && skipPath && q.u.split('?')[0] === skipPath));
+    const bad = [];
+    let next = 0;
+    const one = async () => {
+      for (;;) {
+        const q = list[next]; next += 1;
+        if (!q) return;
+        if (this.stopped) throw STOP;
+        const p = replay.prepare(q, { origin: cfg.origin, token: this.token, was: cfg.recording.was, user: this.spec.user, userId: this.spec.userId, ssoId: cfg.ssoId });
+        let r;
+        // A file a browser would fetch and that cannot be fetched is not a failed step; a data request is.
+        try { r = await this.send(p.method, p.url, p.headers, p.body); } catch (err) { if (p.kind === 'static' && err !== STOP) continue; throw err; }
+        // ServiceNow answers a stale token with a fresh one: take it and ask again, as its own pages do.
+        if (r.status === 401 && r.headers['x-usertoken-response']) { this.token = r.headers['x-usertoken-response']; r = await this.send(p.method, p.url, { ...p.headers, 'X-UserToken': this.token }, p.body); }
+        const why = replay.failed(r.status, p.recorded);
+        if (why && p.kind !== 'static') bad.push(`${why} for ${p.method} ${q.u.split('?')[0]}`);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(6, list.length) }, one));
+    return bad.length ? `${bad.length} of ${list.length} requests of this step failed: ${bad[0]}` : '';
+  }
+
+  async loop() {
+    const cfg = this.run.cfg;
+    const full = (u) => (/^https?:\/\//i.test(u) ? u : cfg.origin + (u.startsWith('/') ? '' : '/') + u);
+    const byLink = cfg.entry === 'link' && cfg.steps[0] && cfg.steps[0].type === 'open';
+    let iterations = 0;
+    try {
+      await this.arrive();
+      for (;;) {
+        await this.gate();
+        let arriving = false;
+        if (!this.signedIn || cfg.sessionMode === 'relogin') {
+          this.jar.clear(); this.token = ''; this.signedIn = false; arriving = byLink;
+          if (!byLink) {
+            const s = await this.timed(-1, 'Sign in (SSO)', async () => { const r = await this.enter(null); return { status: r.status, url: r.url }; });
+            if (!s.ok) {
+              iterations += 1;
+              if (cfg.iterations && iterations >= cfg.iterations) break;
+              await this.pause(Math.max(5000, cfg.thinkMs || 0));
+              continue;
+            }
+          }
+        }
+        for (let i = 0; i < cfg.steps.length; i += 1) {
+          await this.gate();
+          const st = cfg.steps[i];
+          if (st.type === 'wait') { await this.pause(Number(st.ms) || 1000); continue; }
+          const name = st.name || `${st.type} ${st.url || st.selector || ''}`.trim();
+          const s = await this.timed(i, name, async () => {
+            let r = { status: 0, url: '' };
+            let skip = '';
+            if (st.type === 'open') {
+              const url = full(st.url);
+              r = arriving && i === 0 ? await this.enter(url) : await this.follow('GET', url);
+              if (r.provider || replay.isLoginPage(r.url, r.text)) { this.signedIn = false; return { status: r.status, url: r.url, error: 'not signed in: ServiceNow asked this user to sign in again' }; }
+              this.token = replay.findToken(r.text) || this.token;
+              skip = new URL(url).pathname;
+              const why = replay.failed(r.status, 200);
+              if (why) return { status: r.status, url: r.url, error: why };
+            }
+            const error = await this.replayStep(i, skip);
+            return { status: r.status, url: r.url, error };
+          }, arriving && i === 0);
+          if (!this.signedIn) break;
+          if (!s.ok && s.error && /time limit/.test(s.error)) { /* keep going: the next step may still answer */ }
+          if (cfg.thinkMs) await this.pause(cfg.thinkMs * (0.75 + Math.random() * 0.5));
+        }
+        iterations += 1; this.cold = false;
+        if (cfg.iterations && iterations >= cfg.iterations) break;
+        if (!this.signedIn) await this.pause(Math.max(3000, cfg.thinkMs || 0));
+      }
+    } catch (err) {
+      if (err !== STOP) out.log.push(`${this.spec.user}: ${String(err.message || err).split('\n')[0]}`);
+    }
+    this.done = true; this.at = 'finished';
+    if (!this.stopped) out.finished.push(this.spec.id);
+  }
+}
+
 // ---- making the desired state true ----------------------------------------
 async function launch(cfg) {
   const { chromium } = require('playwright-core');
@@ -664,7 +859,7 @@ async function reconcile() {
       out.fatal = String(err.message || err);
       current = null; await sleep(5000); return;
     }
-    if (current.cfg.type !== 'api') try { current.browser = await launch(current.cfg); } catch (err) {
+    if (current.cfg.type === 'ui') try { current.browser = await launch(current.cfg); } catch (err) {
       // Nothing can run without a browser: tell the controller, which ends the run with this reason.
       out.fatal = `No browser could be started on this worker. ${err.message}`;
       current = null; await sleep(5000); return;
@@ -672,7 +867,7 @@ async function reconcile() {
   }
   for (const spec of desired.vus || []) {
     if (current.vus.has(spec.id)) continue;
-    const v = current.cfg.type === 'api' ? new ApiVU(current, spec) : new VU(current, spec);
+    const v = current.cfg.type === 'api' ? new ApiVU(current, spec) : current.cfg.type === 'http' ? new HttpVU(current, spec) : new VU(current, spec);
     current.vus.set(spec.id, v);
     v.task = v.loop();
   }
@@ -685,7 +880,7 @@ async function sync() {
     runId: (current && current.runId) || desired.runId || '', fatal: out.fatal || '',
     active: current ? [...current.vus.values()].filter((v) => !v.done).length : 0,
     sys: { cpu: cpuPercent(), freeMb: Math.round(os.freemem() / 1048576), totalMb: Math.round(os.totalmem() / 1048576) },
-    samples: out.samples.splice(0), shots: out.shots.splice(0, 4), traces: out.traces.splice(0, 30), finished: out.finished.splice(0), log: out.log.splice(0),
+    samples: out.samples.splice(0), shots: out.shots.splice(0, 4), traces: out.traces.splice(0, 30), finished: out.finished.splice(0), log: out.log.splice(0), recording: out.recording.splice(0),
     activity: current ? [...current.vus.values()].slice(0, 120).map((v) => ({ id: v.spec.id, user: v.spec.user, at: v.at, since: v.since, last: v.last, done: !!v.done })) : [],
   };
   try {

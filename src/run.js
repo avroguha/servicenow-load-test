@@ -16,6 +16,7 @@ const prov = require('./provision');
 const idp = require('./idp');
 const store = require('./store');
 const { resolveProxy } = require('./http');
+const replay = require('./replay');
 const { diagnose } = require('./diagnose');
 
 const BUCKET_MS = 5000;
@@ -42,8 +43,8 @@ function limits(settings = store.settings()) {
 
 function normalize(sc) {
   const n = (v, d, min = 0) => (v !== '' && v != null && Number.isFinite(Number(v)) && Number(v) >= min ? Number(v) : d);
-  const load = sc.load || {};
-  const limit = sc.limit || {};
+  const load = { ...(sc.load || {}) };
+  const limit = { ...(sc.limit || {}) };
   const type = sc.type === 'api' ? 'api' : 'ui';
   const steps = (sc.steps || []).filter((s) => s && s.type).map((s) => ({
     type: s.type, name: String(s.name || '').trim(), url: String(s.url || '').trim(), selector: String(s.selector || '').trim(),
@@ -51,6 +52,15 @@ function normalize(sc) {
     method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(String(s.method || '').toUpperCase()) ? String(s.method).toUpperCase() : 'GET',
     body: s.body == null ? '' : String(s.body),
   }));
+  // Simple setup: one of three questions and a number or two; the pattern is worked out from them.
+  const mode = type !== 'api' && load.mode === 'simple' ? 'simple' : 'advanced';
+  const question = ['sustain', 'surge', 'parallel'].includes(load.question) ? load.question : 'sustain';
+  const qUsers = Math.max(1, Math.floor(n(load.qUsers, 20, 1)));
+  const qMinutes = Math.max(1, n(load.qMinutes, 10, 1));
+  const qPeople = Math.max(1, Math.floor(n(load.qPeople, 1000, 1)));
+  const visitSeconds = Math.max(5, n(load.visitSeconds, 30, 1));
+  const simple = mode === 'simple' ? simplePlan({ question, users: qUsers, minutes: qMinutes, people: qPeople, visitSeconds }) : null;
+  if (simple) { Object.assign(load, simple); limit.action = simple.action; }
   const pattern = ['ramp', 'sustained', 'parallel'].includes(load.pattern) ? load.pattern : 'ramp';
   const maxUsers = Math.max(1, Math.floor(n(load.maxUsers, 10, 1)));
   const authModes = type === 'api' ? ['basic', 'oauth'] : ['sso', 'local'];
@@ -65,6 +75,10 @@ function normalize(sc) {
     },
     steps,
     load: {
+      mode, question, qUsers, qMinutes, qPeople, visitSeconds,
+      // Who carries the load of a browser test: real browsers, lightweight users (the recorded requests), or
+      // whichever fits - browsers while this machine can drive that many, lightweight users beyond.
+      engine: type === 'api' ? 'browser' : ['browser', 'http'].includes(load.engine) ? load.engine : 'auto',
       pattern,
       // sustained and parallel
       users: Math.max(1, Math.floor(n(load.users, 5, 1))),
@@ -95,6 +109,18 @@ function plan(sc) {
   return { start: l.startUsers, step: l.stepUsers, stepSeconds: l.stepSeconds, max: l.maxUsers, seconds: stages * l.stepSeconds + l.holdSeconds, passes: 0 };
 }
 
+// 'ui' browsers, 'http' lightweight users, 'api'.
+function engineOf(sc, lim) {
+  if (sc.type === 'api') return 'api';
+  if (sc.load.engine === 'http') return 'http';
+  if (sc.load.engine === 'browser' || !lim) return 'ui';
+  return plan(sc).max > lim.maxBrowsers ? 'http' : 'ui';
+}
+function recordingOf(sc) {
+  const rec = sc.id ? store.read(`recording-${sc.id}.json`, null) : null;
+  return rec && rec.key === replay.stepsKey(sc.steps) ? rec : null;
+}
+
 function validate(sc, lim) {
   const errs = [];
   if (!sc.steps.some((s) => s.type !== 'wait')) errs.push(sc.type === 'api' ? 'Add at least one request.' : 'Add at least one link to open.');
@@ -107,10 +133,102 @@ function validate(sc, lim) {
   if (!prov.NAME_RE.test(sc.users.prefix)) errs.push('Temporary user name: use 2-39 letters, digits, dot, dash or underscore.');
   if (lim) {
     const peak = plan(sc).max;
-    const cap = sc.type === 'api' ? lim.maxApiUsers : lim.maxBrowsers;
-    if (peak > cap) errs.push(sc.type === 'api' ? `${peak} API users is above the limit of ${cap} (Settings > Capacity).` : `${peak} browsers at once is above this machine's limit of ${cap} (Settings > Capacity). More would measure the test machine, not ServiceNow.`);
+    const eng = engineOf(sc, lim);
+    const cap = eng === 'ui' ? lim.maxBrowsers : lim.maxApiUsers;
+    if (peak > cap) errs.push(eng === 'api' ? `${peak} API users is above the limit of ${cap} (Capacity and workers).` : eng === 'http' ? `${peak} lightweight users at the same moment is above the limit of ${cap} (Capacity and workers: "Most API users at once").` : `${peak} browsers at once is above this machine's limit of ${cap} (Capacity and workers). More would measure the test machine, not ServiceNow. Choose lightweight users for this many.`);
+    if (eng === 'http') {
+      if (sc.authMode !== 'sso') errs.push('Lightweight users sign in through Mock SSO only. Choose Mock SSO under Test users, or use real browsers.');
+      if (!recordingOf(sc)) errs.push(`This test needs ${peak} users at the same moment, more than the ${lim.maxBrowsers} browsers this machine can drive, so it runs with lightweight users - and those repeat what a browser did. Press "Test (1 user, once)" first: a passing test run records it. (After changing a step, test again.)`);
+    }
   }
   return errs;
+}
+
+// ---- the three questions of the simple setup --------------------------------
+// Someone who is not a tester asks one of these, with one or two numbers:
+//   sustain  - can the instance carry X people doing this for M minutes?
+//   surge    - P people (the company) click within M minutes: can it take that?
+//   parallel - how many people can do this at the same moment?
+// Each becomes one of the load patterns. `visit` is how long one person's visit
+// takes (measured by the last test run), which turns "P people in M minutes"
+// into "so many at the same moment".
+function simplePlan(q) {
+  const visit = Math.max(5, Number(q.visitSeconds) || 30);
+  const users = Math.max(1, Math.floor(Number(q.users) || 1));
+  const minutes = Math.max(1, Number(q.minutes) || 10);
+  const stepSeconds = Math.max(30, Math.ceil((visit * 2) / 10) * 10);
+  if (q.question === 'surge') {
+    const people = Math.max(1, Math.floor(Number(q.people) || 1));
+    const together = Math.max(1, Math.ceil((people * visit) / (minutes * 60)));
+    const stepUsers = Math.max(1, Math.ceil(together / 5));
+    const rampSeconds = Math.ceil((together - stepUsers) / stepUsers) * stepSeconds;
+    return { pattern: 'ramp', startUsers: stepUsers, stepUsers, stepSeconds, maxUsers: together, holdSeconds: Math.max(60, Math.round(minutes * 60 - rampSeconds)), sessionMode: 'relogin', together, people, minutes, action: 'stop' };
+  }
+  if (q.question === 'parallel') {
+    const stepUsers = Math.max(1, Math.ceil(users / 10));
+    return { pattern: 'ramp', startUsers: stepUsers, stepUsers, stepSeconds, maxUsers: users, holdSeconds: 60, sessionMode: 'keep', action: 'stop' };
+  }
+  return { pattern: 'sustained', users, durationSeconds: Math.round(minutes * 60), sessionMode: 'keep', action: 'continue' };
+}
+
+// When the measured numbers first crossed the line the test set, from the time series.
+function firstTrouble(series, limit) {
+  let streak = 0;
+  for (const p of series || []) {
+    const errPct = p.n ? (100 * p.errors) / p.n : 0;
+    const slow = limit.p95Ms && p.n >= 3 && p.p95 > limit.p95Ms;
+    const failing = p.n >= 3 && errPct > limit.errorPct;
+    if (slow || failing) {
+      streak += 1;
+      // Two measurements in a row: one slow moment is not trouble.
+      if (streak >= 2) return { t: p.t, users: p.users, why: failing ? `${Math.round(errPct)}% of steps failed` : `95% of steps took up to ${(p.p95 / 1000).toFixed(1)} s` };
+    } else streak = 0;
+  }
+  return null;
+}
+
+const dur = (sec) => { const s = Math.round(sec); return s >= 3600 ? `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min` : s >= 120 ? `${Math.round(s / 60)} minutes` : s >= 60 ? `1 min ${s - 60} s` : `${s} seconds`; };
+const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
+
+// The result as an answer to the question that was asked. No verdict is given for a run that did not really run.
+function answer(r) {
+  const sc = r.scenario; const l = sc.load; const t = r.totals;
+  if (r.kind !== 'load' || !t.n) return null;
+  const all = r.steps.flatMap((s) => s.ms || []);
+  const sum = summary(all);
+  const errPct = Math.round((1000 * t.errors) / t.n) / 10;
+  const peak = Math.max(0, ...r.stages.map((s) => s.users));
+  const trouble = firstTrouble(r.series, sc.limit);
+  const what = r.engine === 'http' ? 'lightweight users (recorded requests, no browser)' : sc.type === 'api' ? 'API users' : 'real browsers';
+  const facts = [
+    `${t.n} steps were done by up to ${peak} ${what} at the same moment; ${t.errors} failed (${errPct}%).`,
+    `A step typically took ${secs(sum.p50)}; 95% took ${secs(sum.p95)} or less; the slowest ${secs(sum.max)}.`,
+    `"Too slow" for this test means 95% of steps slower than ${secs(sc.limit.p95Ms)}, or more than ${sc.limit.errorPct}% failing.`,
+  ];
+  if (r.engine === 'http') facts.push('These times are how long ServiceNow took to answer. The time a browser needs to draw the page comes on top; a Test run with one browser shows that.');
+  const stopped = r.stopAskedByUser ? ' The run was stopped by hand before the plan was complete.' : '';
+  const machine = r.limit && r.limit.generatorBusy ? ' The test machine itself was at full CPU at that point, so this may be the test machine and not ServiceNow: repeat with ' + (r.engine === 'http' ? 'a worker on a stronger machine, or more worker machines' : 'lightweight users, or more worker machines') + '.' : '';
+  const q = l.mode === 'simple' ? l.question : l.pattern === 'sustained' ? 'sustain' : 'parallel';
+  let ok; let headline;
+  if (q === 'sustain') {
+    const ran = dur(r.elapsed);
+    if (trouble) { ok = false; headline = `No. ${l.users} people were not carried for the whole time: trouble began after ${dur(trouble.t)} (${trouble.why}).`; }
+    else { ok = !r.limit; headline = r.limit ? `Not cleanly. ${l.users} people ran for ${ran}, but over the whole run ${r.limit.reason}.` : `Yes. ${l.users} people at the same time were carried for ${ran} without trouble.`; }
+  } else if (q === 'surge') {
+    const s = simplePlan({ question: 'surge', people: l.qPeople, minutes: l.qMinutes, visitSeconds: l.visitSeconds });
+    if (r.limit) {
+      const good = r.limit.lastGood;
+      const people = Math.floor((s.people * good) / s.together);
+      ok = false;
+      headline = good
+        ? `No. The instance coped with about ${people.toLocaleString('en')} of the ${s.people.toLocaleString('en')} people arriving within ${s.minutes} minutes (${good} at the same moment). At ${r.limit.users} at the same moment trouble began: ${r.limit.reason}.`
+        : `No. Trouble began at the first level, ${r.limit.users} people at the same moment: ${r.limit.reason}.`;
+    } else { ok = peak >= s.together; headline = ok ? `Yes. ${s.people.toLocaleString('en')} people arriving within ${s.minutes} minutes were carried: that is ${s.together} at the same moment, and no trouble was seen.` : `Not decided: the run ended at ${peak} at the same moment, before reaching the ${s.together} that ${s.people.toLocaleString('en')} people in ${s.minutes} minutes need.`; }
+  } else if (r.limit) {
+    ok = false;
+    headline = r.limit.lastGood ? `About ${r.limit.lastGood} people at the same moment. At ${r.limit.users} trouble began: ${r.limit.reason}.` : `Fewer than ${r.limit.users} people at the same moment: trouble began at the first level (${r.limit.reason}).`;
+  } else { ok = true; headline = `At least ${peak} people at the same moment: no trouble was seen up to there. The limit lies higher - try a larger number.`; }
+  return { ok, question: q, headline: headline + machine + stopped, facts, trouble };
 }
 
 class Controller {
@@ -142,7 +260,7 @@ class Controller {
       totals: r.totals, stages: r.stages.map(({ ms, ...s }) => s), steps: r.steps.map(({ ms, ...s }) => s), series: r.series,
       speed: last && ['running', 'paused'].includes(r.state) ? { rate: last.rate, reqs: last.reqs, avg: last.avg, p95: last.p95, errors: last.errors } : null,
       limit: r.limit, shots: r.shots, trace: r.trace, advice: r.advice, cleanup: r.cleanup, ledger: r.ledger.length, idp: r.idpStats, elapsed: r.elapsed, planSeconds: r.planSeconds,
-      verdict: r.verdict || '', generatorBusy: r.generatorBusy, activity: ['running', 'paused'].includes(r.state) ? this.activity() : [],
+      verdict: r.verdict || '', generatorBusy: r.generatorBusy, engine: r.engine, answer: r.answer || null, activity: ['running', 'paused'].includes(r.state) ? this.activity() : [],
     };
   }
   activity() {
@@ -164,7 +282,8 @@ class Controller {
     if (this.busy()) throw new Error('A run is already active. Stop it first.');
     const scenario = normalize(scenarioRaw);
     const settings = store.settings();
-    const errs = validate(scenario, kind === 'build' ? null : limits(settings));
+    const lim = limits(settings);
+    const errs = validate(scenario, kind === 'build' ? null : lim);
     if (errs.length) throw new Error(errs.join(' '));
     const sn = SN.fromSettings(settings, scenario.instance);
     const p = plan(scenario);
@@ -174,7 +293,7 @@ class Controller {
       id: `${stamp}-${crypto.randomBytes(2).toString('hex')}`, kind, scenario, by, instance: sn.instance, state: 'checking', phase: 'Checking the instance',
       createdAt: Date.now(), startedAt: 0, endedAt: 0, checks: [], error: '', log: [], users: [], ledger: [], target: 0, active: 0,
       totals: { n: 0, errors: 0, serverErrors: 0, requests: 0 }, stages: [], steps: [], series: [], bucket: null, limit: null, shots: [], trace: [],
-      advice: [], cleanup: null, elapsed: 0, planSeconds: kind === 'build' ? 0 : p.seconds, plan: p, idpStats: null, generatorBusy: false, stopAsked: false, finished: new Set(),
+      advice: [], cleanup: null, elapsed: 0, planSeconds: kind === 'build' ? 0 : p.seconds, plan: p, idpStats: null, engine: kind === 'build' ? (scenario.type === 'api' ? 'api' : 'ui') : engineOf(scenario, lim), recorded: [], answer: null, generatorBusy: false, stopAsked: false, finished: new Set(),
     };
     this.run = r; this.sn = sn; this.secret = null;
     this.persist(); this.notify();
@@ -185,7 +304,9 @@ class Controller {
   async go(r, sn, settings, count) {
     const sc = r.scenario;
     const api = sc.type === 'api';
+    const http = r.engine === 'http';
     this.log(`${r.kind === 'build' ? 'Test run' : 'Load run'} "${sc.name}" against ${sn.base}${r.by ? `, started by ${r.by}` : ''}`);
+    if (http) this.log('Running with lightweight users: each sends the requests a browser made in the last test run, with its own session. No browser is opened.');
     const pre = await prov.preflight(sn, sc, count);
     r.checks = pre.checks;
     if (!pre.ok) {
@@ -204,6 +325,7 @@ class Controller {
     });
     r.users = made.users; this.persist();
     this.secret = { password: made.password, sso: made.sso, oauth: made.oauth, idpBaseUrl };
+    r.ssoId = made.sso ? made.sso.id : '';
     if (made.sso) idp.open({ runId: r.id, sso: made.sso, userNames: made.users.map((u) => u.name) });
     if (r.stopAsked) return this.finish('Stopped while creating users');
 
@@ -214,13 +336,15 @@ class Controller {
     this.assign(r);
     const parallel = r.kind !== 'build' && sc.load.pattern === 'parallel';
     r.config = {
-      type: sc.type, origin: sn.base, proxy: resolveProxy(settings, sc.proxy === '(connection)' ? (sn.instance.proxy || 'direct') : sc.proxy), authMode: sc.authMode, ssoId: made.sso ? made.sso.id : '', idpBaseUrl,
+      type: http ? 'http' : sc.type, origin: sn.base, recording: http ? recordingOf(sc) : null, record: r.kind === 'build' && !api, proxy: resolveProxy(settings, sc.proxy === '(connection)' ? (sn.instance.proxy || 'direct') : sc.proxy), authMode: sc.authMode, ssoId: made.sso ? made.sso.id : '', idpBaseUrl,
       oauth: made.oauth ? { clientId: made.oauth.clientId, clientSecret: made.oauth.clientSecret } : null,
       steps: sc.steps, thinkMs: r.kind === 'build' ? 500 : sc.load.thinkMs,
       sessionMode: sc.load.sessionMode, entry: sc.authMode === 'sso' ? sc.load.entry : 'home',
-      iterations: r.kind === 'build' ? 1 : r.plan.passes, screenshots: r.kind === 'build' ? 'all' : 'errors', maxErrorShots: 6,
+      iterations: r.kind === 'build' ? 1 : r.plan.passes, screenshots: r.kind === 'build' ? 'all' : 'errors', maxErrorShots: http ? 12 : 6,
       // Parallel: everyone is prepared first and released in the same instant.
       startAt: parallel ? Date.now() + 8000 : 0,
+      // Otherwise the users of a level arrive spread over its first half (at most 30 s), as people do.
+      spreadMs: parallel || r.kind === 'build' ? 0 : Math.min(30000, r.plan.stepSeconds * 500),
       timeoutMs: sc.load.timeoutSeconds * 1000, quietMs: 700, viewport: { width: 1366, height: 768 },
       headless: settings.headless !== false, browser: settings.browser || 'chrome',
     };
@@ -238,8 +362,8 @@ class Controller {
 
   async ensureWorkers(r, settings, count) {
     const l = r.scenario.load;
-    const api = r.scenario.type === 'api';
-    const per = api ? Math.max(l.usersPerWorker, 25) : l.usersPerWorker;
+    const api = r.scenario.type === 'api' || r.engine === 'http';
+    const per = api ? Math.max(r.engine === 'http' ? 250 : l.usersPerWorker, 25) : l.usersPerWorker;
     const cap = (w) => w.capacity * (api && !w.api ? 25 : 1);
     const alive = () => [...this.workers.values()].filter((w) => Date.now() - w.lastSeen < 6000);
     const capacity = () => alive().reduce((a, w) => a + cap(w), 0);
@@ -356,8 +480,8 @@ class Controller {
     const lim = r.scenario.limit;
     const errPct = st.n ? (100 * st.errors) / st.n : 0;
     st.errorPct = Math.round(errPct * 10) / 10;
-    if (st.n >= 5 && lim.p95Ms && st.p95 > lim.p95Ms) st.breach = `95% of steps took up to ${st.p95} ms (limit ${lim.p95Ms} ms)`;
-    else if (st.n >= 5 && errPct > lim.errorPct) st.breach = `${st.errorPct}% of steps failed (limit ${lim.errorPct}%)`;
+    if (st.n >= 5 && lim.p95Ms && st.p95 > lim.p95Ms) st.breach = `95% of steps took up to ${(st.p95 / 1000).toFixed(1)} s (the line is ${(lim.p95Ms / 1000).toFixed(1)} s)`;
+    else if (st.n >= 5 && errPct > lim.errorPct) st.breach = `${st.errorPct}% of steps failed (the line is ${lim.errorPct}%)`;
     if (st.breach && !r.limit) {
       const before = r.stages.filter((x) => x !== st && x.closed && !x.breach).pop();
       r.limit = { users: st.users, lastGood: before ? before.users : 0, reason: st.breach, generatorBusy: st.busy };
@@ -386,6 +510,7 @@ class Controller {
       for (const sh of body.shots || []) this.shot(r, sh);
       for (const t of body.traces || []) if (r.trace.length < 200) r.trace.push(t);
       for (const id of body.finished || []) r.finished.add(id);
+      if (r.kind === 'build' && r.recorded) for (const st of body.recording || []) if (r.recorded.length < 200) r.recorded.push(st);
       for (const t of body.log || []) this.log(`[${name}] ${t}`);
     }
     if (r) r.active = [...this.workers.values()].filter((x) => Date.now() - x.lastSeen < 6000).reduce((a, x) => a + x.active, 0);
@@ -393,7 +518,7 @@ class Controller {
     const mine = (r.assignment.get(name) || []).filter((i) => i < r.target);
     return {
       runId: r.id, state: r.state, config: r.config,
-      vus: mine.map((i) => ({ id: i, user: r.users[i].name, password: this.secret.password || undefined, ticket: this.secret.sso ? idp.ticket(r.users[i].name) : undefined })),
+      vus: mine.map((i) => ({ id: i, user: r.users[i].name, userId: r.users[i].id, password: this.secret.password || undefined, ticket: this.secret.sso ? idp.ticket(r.users[i].name) : undefined })),
     };
   }
 
@@ -407,7 +532,12 @@ class Controller {
       step.ms.push(ms);
       if (step.n % 5 === 0 || step.n < 20) Object.assign(step, summary(step.ms));
     }
+    // Someone who stays signed in arrives once: signing in and loading every file for the first time is far slower
+    // than what follows and says nothing about the load. It is shown per step, but does not decide the limit.
+    // Where every visit is an arrival (people arriving fresh), it is exactly what is measured.
+    const once = s.arrival && s.ok && r.config && r.config.sessionMode === 'keep' && r.kind !== 'build';
     const st = r.stages[r.stages.length - 1];
+    if (once) { if (st && !st.closed) st.arrivals = (st.arrivals || 0) + 1; return; }
     if (st && !st.closed) { st.n += 1; if (!s.ok) st.errors += 1; st.ms.push(ms); if (st.n % 5 === 0) Object.assign(st, summary(st.ms)); }
     if (r.bucket) { r.bucket.ms.push(ms); r.bucket.reqs += Number(s.requests) || 0; if (!s.ok) r.bucket.errors += 1; }
   }
@@ -479,6 +609,19 @@ class Controller {
       if (t.errors) { failed = true; r.error = r.error || `The test did not pass: ${t.errors} of ${t.n} step${t.n === 1 ? '' : 's'} failed.`; }
       r.verdict = t.errors ? 'failed' : 'passed';
     } else r.verdict = failed ? 'failed' : (r.kind === 'build' ? 'failed' : 'completed');
+    if (r.kind === 'build' && r.verdict === 'passed' && r.scenario.type !== 'api' && (r.recorded || []).length && r.scenario.id) {
+      // What the browser asked for, kept so that a load run can send it again without a browser.
+      const rec = replay.finish(r.recorded, { steps: r.scenario.steps, user: r.users[0] && r.users[0].name, userId: r.users[0] && r.users[0].id, ssoId: r.ssoId });
+      const visit = Math.max(5, Math.round(r.steps.reduce((a, s) => a + (s.avg || 0), 0) / 1000));
+      rec.visitSeconds = visit;
+      store.write(`recording-${r.scenario.id}.json`, rec);
+      const all = store.scenarios();
+      const mine = all.find((x) => x.id === r.scenario.id);
+      if (mine) { mine.load = { ...mine.load, visitSeconds: visit }; store.saveScenarios(all); }
+      this.log(`Recorded for lightweight users: ${rec.requests} requests in ${rec.steps.length} step${rec.steps.length === 1 ? '' : 's'} (${rec.data} of them are data requests a returning visitor sends again). One visit took about ${visit} s.`);
+    }
+    else if (r.kind === 'build' && r.verdict === 'passed' && r.scenario.type !== 'api' && r.scenario.id) this.log('Nothing was recorded for lightweight users: the worker that ran this test did not send a recording. A worker on another machine may be running an older version of the app - update it (Capacity and workers lists the workers).');
+    if (!failed) r.answer = answer(r);
     r.state = failed ? 'failed' : 'done';
     const outcome = r.kind === 'build' ? (r.verdict === 'passed' ? `The test PASSED: ${t.n} step${t.n === 1 ? '' : 's'}, none failed` : 'The test FAILED') : why;
     r.phase = r.cleanup.complete ? `${outcome}. Everything created for the run has been removed.` : `${outcome}. CLEANUP IS NOT COMPLETE - it will be tried again automatically.`;
@@ -535,4 +678,4 @@ function records(activeRun) {
   });
 }
 
-module.exports = { Controller, normalize, validate, plan, summary, cleanStored, janitor, records, limits, hostInfo, MAX_RUN_MS };
+module.exports = { Controller, normalize, validate, plan, summary, simplePlan, firstTrouble, answer, engineOf, recordingOf, cleanStored, janitor, records, limits, hostInfo, MAX_RUN_MS };

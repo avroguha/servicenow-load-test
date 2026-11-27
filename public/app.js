@@ -128,14 +128,30 @@ async function pageTests() {
 const AUTH = { sso: 'Mock SSO', local: 'User name and password', basic: 'Basic authentication', oauth: 'OAuth token' };
 function loadText(t) {
   const l = t.load;
+  if (l.mode === 'simple') { const n = simpleNumbers(l); return l.question === 'surge' ? `${n.people.toLocaleString('en')} people within ${n.minutes} min (${n.together} at once)` : l.question === 'parallel' ? `how many at once, up to ${n.users}` : `${n.users} people for ${n.minutes} min`; }
   if (l.pattern === 'sustained') return `${plural(l.users, 'user')} for ${fmtDur(l.durationSeconds)}`;
   if (l.pattern === 'parallel') return `${plural(l.users, 'user')} at the same moment, ${l.passes} time${l.passes === 1 ? '' : 's'} each`;
   return `${l.startUsers} to ${l.maxUsers} users, +${l.stepUsers} every ${fmtDur(l.stepSeconds)}`;
 }
+function simpleNumbers(l) {
+  const visit = Math.max(5, +l.visitSeconds || 30);
+  const users = Math.max(1, Math.floor(+l.qUsers || 1));
+  const minutes = Math.max(1, +l.qMinutes || 10);
+  const people = Math.max(1, Math.floor(+l.qPeople || 1));
+  const together = Math.max(1, Math.ceil((people * visit) / (minutes * 60)));
+  return { visit, users, minutes, people, together, peak: l.question === 'surge' ? together : users };
+}
+function simpleText(l) {
+  const n = simpleNumbers(l);
+  if (l.question === 'surge') return `${n.people.toLocaleString('en')} people arriving within ${n.minutes} minutes is about <b>${n.together}</b> at the same moment, because one visit takes about ${n.visit} s (measured by the last test run). People are added in 5 steps up to that number, each one arriving fresh, and the run stops at the first sign of trouble. It takes about ${n.minutes} minutes.`;
+  if (l.question === 'parallel') return `Starts with ${Math.ceil(n.users / 10)} people and adds ${Math.ceil(n.users / 10)} at a time, up to <b>${n.users}</b>. Each level is held long enough to measure it, and the run stops at the first sign of trouble.`;
+  return `<b>${n.users}</b> people keep going through the steps for ${n.minutes} minutes. The answer says whether it held up and, if not, after how long trouble began.`;
+}
+const QUESTION = { sustain: 'Steady load', surge: 'Everyone at once', parallel: 'How many at once' };
 const blank = () => ({
   id: '', name: '', type: 'ui', instance: (insts()[0] || {}).id || '', proxy: '(connection)', authMode: 'sso', users: { prefix: 'lt.user.', roles: [], groups: [] },
   steps: [{ type: 'open', name: '', url: '' }],
-  load: { pattern: 'ramp', users: 5, durationSeconds: 300, passes: 1, startUsers: 1, stepUsers: 1, stepSeconds: 60, maxUsers: 5, holdSeconds: 60, thinkSeconds: 3, sessionMode: 'keep', entry: 'home', usersPerWorker: 5, localWorkers: 'auto', timeoutSeconds: 60 },
+  load: { mode: 'simple', question: 'sustain', qUsers: 20, qMinutes: 10, qPeople: 1000, visitSeconds: 30, engine: 'auto', pattern: 'ramp', users: 5, durationSeconds: 300, passes: 1, startUsers: 1, stepUsers: 1, stepSeconds: 60, maxUsers: 5, holdSeconds: 60, thinkSeconds: 3, sessionMode: 'keep', entry: 'link', usersPerWorker: 5, localWorkers: 'auto', timeoutSeconds: 60 },
   limit: { p95Ms: 8000, errorPct: 5, action: 'pause' },
 });
 
@@ -155,9 +171,8 @@ const choice = (k, v, title, text) => `<button type="button" class="choice ${get
 function drawEditor() {
   const api_ = ed.type === 'api';
   const lim = settings.limits || {};
-  const cap = api_ ? lim.maxApiUsers : lim.maxBrowsers;
   const l = ed.load;
-  const peak = l.pattern === 'ramp' ? +l.maxUsers : +l.users;
+  const peak = !api_ && l.mode === 'simple' ? simpleNumbers(l).peak : l.pattern === 'ramp' ? +l.maxUsers : +l.users;
   const h = [head(ed.id ? ed.name || 'Test' : 'New test', 'Describe what a user does. Press Test to try it once with a single user before putting load on the instance.', '<a class="btn" href="#/tests">Back to tests</a>')];
 
   h.push(`<div class="card"><h2>1. What to test</h2><p class="hint">Give it a name and choose how ServiceNow is reached.</p>
@@ -192,7 +207,29 @@ function drawEditor() {
       ${inp('users.roles', 'Roles (comma separated)', { ph: 'itil' })}${inp('users.groups', 'Groups (comma separated)', { ph: 'Service Desk' })}</div></div>`);
 
   const pat = l.pattern;
-  h.push(`<div class="card"><h2>4. Load</h2><p class="hint">How users are put on the instance.</p>
+  const simple = !api_ && l.mode === 'simple';
+  const eng = api_ ? 'api' : l.engine === 'http' ? 'http' : l.engine === 'browser' ? 'ui' : peak > lim.maxBrowsers ? 'http' : 'ui';
+  const capNow = eng === 'ui' ? lim.maxBrowsers : lim.maxApiUsers;
+  const who = eng === 'api' ? 'API user' : eng === 'http' ? 'lightweight user' : 'browser';
+  const rec = ed.recorded;
+  const engineNote = eng !== 'http' ? ''
+    : `<div class="banner ${rec ? 'info' : 'limit'}" style="font-weight:400"><b>Runs with lightweight users.</b> ${peak} at the same moment is more than the ${lim.maxBrowsers} real browsers this machine can drive, so each user sends the requests a browser made, with its own sign-in and session, without opening a browser. ServiceNow gets the same requests; what is not measured is the time a browser needs to draw the page.
+        <small>${rec ? `Recorded by the test run of ${fmtTime(rec.at)}: ${rec.requests} requests per visit, one visit takes about ${rec.visitSeconds || l.visitSeconds} s. Test again after changing a step.` : 'Nothing is recorded yet: press <b>Test (1 user, once)</b> first. A passing test run records what the browser asks for.'}</small></div>`;
+  h.push(`<div class="card"><h2>4. Load</h2>
+    ${api_ ? '' : `<div class="seg" style="margin-bottom:14px"><button type="button" class="${simple ? 'on' : ''}" data-choice="load.mode" data-v="simple">Simple</button><button type="button" class="${simple ? '' : 'on'}" data-choice="load.mode" data-v="advanced">Advanced</button></div>`}
+    ${simple ? `<p class="hint">What do you want to know?</p>
+    <div class="choices" style="margin-bottom:14px">
+      ${choice('load.question', 'sustain', 'Can it carry a steady load?', 'A number of people keep working for a while. Does it hold up, and if not, after how long does it get slow?')}
+      ${choice('load.question', 'surge', 'Can it take everyone at once?', 'An email goes to the whole company and people click within minutes. How many of them can it take?')}
+      ${choice('load.question', 'parallel', 'How many at the same moment?', 'Add people step by step until it gets slow or fails. The answer is the last number that still worked.')}
+    </div>
+    <div class="grid">${l.question === 'surge' ? inp('load.qPeople', 'People in the company', { type: 'number', min: 1 }) + inp('load.qMinutes', 'They all arrive within (minutes)', { type: 'number', min: 1, hint: 'After such an email, most clicks come in the first 10 to 30 minutes.' })
+    : l.question === 'parallel' ? inp('load.qUsers', 'Try up to (people at the same moment)', { type: 'number', min: 1 })
+      : inp('load.qUsers', 'People using it at the same time', { type: 'number', min: 1 }) + inp('load.qMinutes', 'For how long (minutes)', { type: 'number', min: 1 })}
+      ${ed.authMode !== 'sso' ? '' : sel('load.entry', 'How people arrive', [['link', 'By clicking the first link, not signed in yet (an email link)'], ['home', 'Already signed in, then the steps']])}
+    </div>
+    <div class="banner info" style="font-weight:400"><b>What will run.</b> ${simpleText(l)}</div>`
+    : `<p class="hint">How users are put on the instance.</p>
     <div class="choices" style="margin-bottom:14px">
       ${choice('load.pattern', 'ramp', 'Find the limit', 'Start small and add users step by step until pages get slow or fail.')}
       ${choice('load.pattern', 'sustained', 'Sustained load', 'A steady number of users for a set time. Shows whether the instance holds up.')}
@@ -205,14 +242,16 @@ function drawEditor() {
       ${inp('load.timeoutSeconds', 'Give up on a step after (seconds)', { type: 'number', min: 5 })}
       ${api_ ? '' : sel('load.sessionMode', 'Session', [['keep', 'Sign in once and keep going'], ['relogin', 'Arrive fresh for every pass']])}
       ${api_ || ed.authMode !== 'sso' ? '' : sel('load.entry', 'Arrival', [['home', 'Sign in first, then the steps'], ['link', 'Click the first link with no session']], 'The second is someone clicking a link in an email.')}
-    </div>
-    <div class="banner ${peak > cap ? 'bad' : 'info'}" style="font-weight:400">${peak > cap
-    ? `<b>${peak} ${api_ ? 'API users' : 'browsers'} is above the limit of ${cap}.</b> ${api_ ? '' : `This machine has ${lim.cores} cores; more browsers than that would measure the test machine, not ServiceNow.`} ${me.role === 'admin' ? 'Change it under <a href="#/admin/capacity">Capacity and workers</a>.' : ''}`
-    : `Peak: <b>${plural(peak || 0, api_ ? 'API user' : 'browser')}</b> of ${cap} allowed on this machine. ${plural(peak || 0, 'temporary user')} will be created on ServiceNow and removed afterwards.`}</div></div>`);
+      ${api_ ? '' : sel('load.engine', 'Users are', [['auto', 'Chosen for me: browsers while this machine can, lightweight users beyond'], ['browser', 'Real browsers'], ['http', 'Lightweight users (recorded requests, no browser)']], 'Lightweight users reach thousands from one machine.')}
+    </div>`}
+    ${engineNote}
+    <div class="banner ${peak > capNow ? 'bad' : 'info'}" style="font-weight:400">${peak > capNow
+    ? `<b>${peak} ${who}s at the same moment is above the limit of ${capNow}.</b> ${eng === 'ui' ? `This machine has ${lim.cores} cores; more browsers than that would measure the test machine, not ServiceNow.` : ''} ${me.role === 'admin' ? 'Change it under <a href="#/admin/capacity">Capacity and workers</a>.' : 'An administrator can raise it.'}`
+    : `Most at the same moment: <b>${plural(peak || 0, who)}</b> of ${capNow} allowed. ${plural(peak || 0, 'temporary user')} will be created on ServiceNow and removed afterwards.`}</div></div>`);
 
-  h.push(`<div class="card"><h2>5. When is it too slow?</h2><p class="hint">The run marks the first step of the load that crosses this line.</p>
+  h.push(`<div class="card"><h2>5. When is it too slow?</h2><p class="hint">The line between "fine" and "trouble". The answer at the end is measured against it.</p>
     <div class="grid">${inp('limit.p95Ms', '95% of steps slower than (ms)', { type: 'number', min: 0 })}${inp('limit.errorPct', 'Or more failed steps than (%)', { type: 'number', min: 0, step: '0.5' })}
-      ${sel('limit.action', 'Then', [['pause', 'Pause the run'], ['stop', 'Stop and clean up'], ['continue', 'Note it and continue']])}</div></div>`);
+      ${!api_ && l.mode === 'simple' ? '' : sel('limit.action', 'Then', [['pause', 'Pause the run'], ['stop', 'Stop and clean up'], ['continue', 'Note it and continue']])}</div></div>`);
 
   h.push(`<div class="actionbar"><button class="btn" id="edSave">Save</button>
     <button class="btn" id="edTest" title="One temporary user goes through the steps once. Everything is removed afterwards.">Test (1 user, once)</button>
@@ -224,6 +263,7 @@ function drawEditor() {
   $('edRun').onclick = guard(async () => {
     const t = await saveTest(true);
     const n = t.load.pattern === 'ramp' ? t.load.maxUsers : t.load.users;
+    ed.load = { ...ed.load, ...t.load };
     if (!confirm(`Run "${t.name}"?\n\n${plural(n, 'temporary user')} will be created on ${(instOf(t.instance) || {}).url || 'the instance'} and removed when the run ends.`)) return;
     await api('POST', '/api/run', { scenarioId: t.id, kind: 'load' }); location.hash = '#/run';
   });
@@ -251,7 +291,7 @@ view.addEventListener('input', (e) => {
   if (d.k && ed) { set(ed, d.k, e.target.value); if (['load.maxUsers', 'load.users'].includes(d.k) && e.type === 'change') drawEditor(); }
   if (d.s !== undefined && ed) { ed.steps[+d.s][d.sk] = e.target.value; if (d.sk === 'method') $('steps').innerHTML = stepsHtml(); }
 });
-view.addEventListener('change', (e) => { const d = e.target.dataset; if (ed && d.k && ['load.maxUsers', 'load.users', 'users.prefix', 'load.durationSeconds', 'instance'].includes(d.k)) drawEditor(); });
+view.addEventListener('change', (e) => { const d = e.target.dataset; if (ed && d.k && ['load.maxUsers', 'load.users', 'users.prefix', 'load.durationSeconds', 'instance', 'load.qUsers', 'load.qMinutes', 'load.qPeople', 'load.engine'].includes(d.k)) drawEditor(); });
 async function saveTest(strict) {
   if (!String(ed.name || '').trim()) throw new Error('Give the test a name.');
   const out = await api('PUT', '/api/scenarios', ed);
@@ -285,17 +325,18 @@ function runHtml(r, workers, isLive) {
   const order = PHASES.map((p) => p[0]); const at = order.indexOf(r.state === 'paused' ? 'running' : r.state === 'failed' ? 'done' : r.state);
   const h = [];
   const ctl = isLive && active ? `<button class="btn" data-run="pause" ${r.state === 'running' && r.kind !== 'build' ? '' : 'disabled'}>Pause</button><button class="btn" data-run="resume" ${r.state === 'paused' ? '' : 'disabled'}>Resume</button><button class="btn danger" data-run="stop" ${r.state === 'stopping' ? 'disabled' : ''} title="Ends the load and removes everything the run created on the instance.">Stop and clean up</button>` : (isLive ? `<a class="btn" href="#/tests/${sc.id}">Open the test</a>` : '<a class="btn" href="#/history">Back to history</a>');
-  h.push(head(`${r.kind === 'build' ? 'Test run' : PATTERN[sc.load.pattern]}: ${sc.name}`, `<span class="pill ${r.verdict === 'passed' ? 'good' : r.state}">${esc(r.verdict === 'passed' ? 'passed' : r.state)}</span> &nbsp;${esc(r.phase || '')}`, ctl));
+  h.push(head(`${r.kind === 'build' ? 'Test run' : sc.load.mode === 'simple' ? QUESTION[sc.load.question] : PATTERN[sc.load.pattern]}: ${sc.name}`, `<span class="pill ${r.verdict === 'passed' ? 'good' : r.state}">${esc(r.verdict === 'passed' ? 'passed' : r.state)}</span> &nbsp;${esc(r.phase || '')}`, ctl));
 
   h.push(`<div class="card"><div class="steps-flow">${PHASES.map(([k, label], i) => `<span class="phase ${i < at || r.state === 'done' ? 'done' : i === at ? 'on' : ''}">${label}</span>`).join('')}</div>
     ${r.kind === 'load' && r.planSeconds ? `<div class="progress"><i style="width:${Math.min(100, (100 * r.elapsed) / r.planSeconds).toFixed(1)}%"></i></div><p class="hint" style="margin:6px 0 0">${fmtDur(r.elapsed)} of ${fmtDur(r.planSeconds)} planned</p>` : ''}
-    <dl class="kv" style="margin-top:12px"><dt>Instance</dt><dd>${r.instance ? `<b>${esc(r.instance.name)}</b> <code>${esc(r.instance.url)}</code>${r.instance.proxy ? ` through proxy ${esc(r.instance.proxy)}` : ''}` : ''}</dd><dt>Type</dt><dd>${api_ ? 'API' : 'Browser'} · ${esc(AUTH[sc.authMode])}${r.kind === 'load' ? ` · ${esc(loadText(sc))}` : ''}</dd>
+    <dl class="kv" style="margin-top:12px"><dt>Instance</dt><dd>${r.instance ? `<b>${esc(r.instance.name)}</b> <code>${esc(r.instance.url)}</code>${r.instance.proxy ? ` through proxy ${esc(r.instance.proxy)}` : ''}` : ''}</dd><dt>Type</dt><dd>${api_ ? 'API' : r.engine === 'http' ? 'Lightweight users (recorded browser requests)' : 'Browser'} · ${esc(AUTH[sc.authMode])}${r.kind === 'load' ? ` · ${esc(loadText(sc))}` : ''}</dd>
       <dt>Started</dt><dd>${fmtTime(r.createdAt)}${r.by ? ` by ${esc(r.by)}` : ''} · run ${esc(r.id)}</dd>
       <dt>On the instance</dt><dd>${r.cleanup ? (r.cleanup.complete ? `<span class="pill good">removed</span> ${r.cleanup.deleted} record(s) deleted, nothing left` : `<span class="pill bad">cleanup pending</span> ${(r.cleanup.remaining || []).length} record(s) may remain - retried automatically <button class="btn small" data-clean="${r.id}">Clean up now</button>`)
     : r.ledger ? `${plural(r.ledger, 'record')} created for this run · removed when it ends, and no later than ${new Date(r.removeBy).toLocaleTimeString([], { timeStyle: 'short' })}` : 'nothing created yet'}</dd></dl>
+    ${r.answer ? `<div class="answer ${r.answer.ok ? 'ok' : 'no'}"><span>${esc({ sustain: 'Can it carry a steady load?', surge: 'Can it take everyone at once?', parallel: 'How many at the same moment?' }[r.answer.question] || 'Result')}</span><b>${esc(r.answer.headline)}</b><ul>${r.answer.facts.map((f) => `<li>${esc(f)}</li>`).join('')}</ul></div>` : ''}
     ${r.kind === 'build' && r.verdict === 'passed' ? `<div class="banner ok">Passed: all ${(r.totals || {}).n || 0} step(s) succeeded with one user. The test is ready for load.</div>` : ''}
     ${r.error ? `<div class="banner bad">${r.kind === 'build' ? 'Failed. ' : ''}${esc(r.error)}</div>` : ''}
-    ${r.limit ? `<div class="banner limit">Limit reached at ${r.limit.users} users: ${esc(r.limit.reason)}.<small>${r.limit.lastGood ? `The last step that stayed inside the limit was ${r.limit.lastGood} users.` : 'No earlier step stayed inside the limit.'}${r.limit.generatorBusy ? ' The load generator was at full CPU in that step, so this may be the test machine and not ServiceNow.' : ''}</small></div>`
+    ${r.answer ? '' : r.limit ? `<div class="banner limit">Limit reached at ${r.limit.users} users: ${esc(r.limit.reason)}.<small>${r.limit.lastGood ? `The last step that stayed inside the limit was ${r.limit.lastGood} users.` : 'No earlier step stayed inside the limit.'}${r.limit.generatorBusy ? ' The load generator was at full CPU in that step, so this may be the test machine and not ServiceNow.' : ''}</small></div>`
     : r.kind === 'load' && r.state === 'done' && r.stages.length ? `<div class="banner ok">No limit reached up to ${Math.max(...r.stages.map((s) => s.users))} users at the same time.</div>` : ''}
     ${isLive && r.generatorBusy ? '<div class="banner limit">A worker machine is at 90% CPU or more: times measured now include the test machine being slow.</div>' : ''}</div>`);
 
@@ -334,7 +375,7 @@ function runHtml(r, workers, isLive) {
   }
 
   if (r.kind === 'load' && r.series && r.series.length) {
-    h.push(`<div class="card"><h2>Response time and users over time</h2><canvas></canvas>
+    h.push(`<div class="card"><h2>What happened over time</h2><p class="hint">Left scale: how long steps took. Right scale: people active. Red dots: failed steps. ${r.answer && r.answer.trouble ? `The red vertical line is where trouble began (${fmtDur(r.answer.trouble.t)} in, ${r.answer.trouble.users} people active).` : ''}</p><canvas></canvas>
       <div class="legend"><span><i style="background:var(--accent)"></i>95% of steps faster than</span><span><i style="background:var(--chart2)"></i>users active</span><span><i style="background:var(--bad)"></i>failed steps</span><span><i style="background:var(--bad);height:1px"></i>your limit</span></div></div>`);
   }
   if (r.kind === 'load' && r.stages && r.stages.length > 1) {
@@ -397,6 +438,8 @@ function drawChart(cv, r) {
   };
   line('users', yU, col('--chart2'), true);
   line('p95', yMs, col('--accent'), false);
+  const tr = r.answer && r.answer.trouble;
+  if (tr) { g.strokeStyle = col('--bad'); g.lineWidth = 2; g.beginPath(); g.moveTo(x(tr.t), T); g.lineTo(x(tr.t), H - B); g.stroke(); g.fillStyle = col('--bad'); g.textAlign = x(tr.t) > W - 160 ? 'right' : 'left'; g.fillText(' trouble began ', x(tr.t), T + 12); }
   g.fillStyle = col('--bad');
   all.forEach((p) => { if (p.errors) { g.beginPath(); g.arc(x(p.t), H - B - 4, Math.min(6, 2 + p.errors), 0, 7); g.fill(); } });
 }

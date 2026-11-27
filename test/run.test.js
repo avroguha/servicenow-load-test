@@ -77,7 +77,11 @@ test('the three load patterns become a plan the clock can follow', () => {
 test('a test above the machine\'s limit is refused, browser and API separately', () => {
   const lim = { maxBrowsers: 10, maxApiUsers: 500 };
   const ui = normalize({ type: 'ui', users: { prefix: 'lt.' }, steps: [{ type: 'open', url: '/' }], load: { pattern: 'sustained', users: 11 } });
-  assert.match(validate(ui, lim).join(' '), /above this machine's limit of 10/);
+  // Told to use real browsers: more than the machine can drive is refused, and the way out is named.
+  assert.match(validate({ ...ui, load: { ...ui.load, engine: 'browser' } }, lim).join(' '), /above this machine's limit of 10[\s\S]*lightweight users/);
+  // Left to choose: more than the machine's browsers means lightweight users, which need a recording first.
+  assert.match(validate(ui, lim).join(' '), /runs with lightweight users[\s\S]*Press "Test \(1 user, once\)" first/);
+  assert.match(validate({ ...ui, authMode: 'local' }, lim).join(' '), /Mock SSO only/);
   assert.deepStrictEqual(validate({ ...ui, load: { ...ui.load, users: 10 } }, lim), []);
   const apiTest = normalize({ type: 'api', users: { prefix: 'lt.' }, steps: [{ type: 'open', url: '/api/now/table/incident', method: 'post', body: '{"a":1}' }], load: { pattern: 'parallel', users: 400 } });
   assert.strictEqual(apiTest.authMode, 'basic'); assert.strictEqual(apiTest.steps[0].method, 'POST');

@@ -11,9 +11,13 @@ try it once, then put load on it and watch what happens and how fast.
   you name, and whatever the sign-in method needs (an identity provider record
   for Mock SSO, a temporary OAuth client for OAuth). It removes all of it when
   the run ends.
-- **Three ways to apply load.** *Find the limit* (add users step by step),
-  *Sustained* (a steady number for a set time), *Parallel* (everyone starts in
-  the same instant).
+- **Three questions, in plain words.** *Can it carry a steady load?* *Can it
+  take everyone at once?* *How many at the same moment?* You give a number or
+  two; the run ends with the answer in a sentence and a chart of when trouble
+  began. An advanced setup gives every setting.
+- **Thousands of users from one machine.** A real browser costs a good part of
+  a CPU core. *Lightweight users* send the requests a browser made, each with
+  its own sign-in and session, without opening a browser.
 - **A Test button** on every test: one temporary user goes through the steps
   once, with a screenshot (UI) or the answer (API) for each step.
 - **It explains failures itself.** After a run with failures the app looks on
@@ -33,6 +37,9 @@ Needs Node 20+ and a browser for UI tests: Google Chrome or Edge already
 installed, or Playwright's own Chromium (`npx playwright-core install
 chromium`). `UILOAD_PORT`, `UILOAD_HOST` (default `127.0.0.1`) and `UILOAD_DATA`
 (default `./data`) change the defaults.
+
+On Windows without Docker, `scriptsstart-windows.cmd` does the same and keeps
+settings and results in `%USERPROFILE%sn-load-test-data`.
 
 That is the way to try it on one machine. To run it for a team, see
 **Deploying with Docker** below: HTTPS on 443, one command.
@@ -60,10 +67,57 @@ That is the way to try it on one machine. To run it for a team, see
    or a CSS selector) makes sure the right page was reached.
 3. **Test users** - sign-in method, the name they start with (`lt.user.` gives
    `lt.user.001`, ...), roles and groups.
-4. **Load** - the pattern and its numbers, how long a user stays on a page.
-5. **When is it too slow** - the line that marks "the limit".
+4. **Load** - *Simple*: one of three questions and a number or two (below).
+   *Advanced*: the pattern and all its numbers.
+5. **When is it too slow** - the line between "fine" and "trouble".
 
 **Save**, then **Test (1 user, once)**. When that is green, **Run load test**.
+
+### The three questions (simple setup)
+
+| Question | You give | What runs | The answer |
+|---|---|---|---|
+| **Can it carry a steady load?** | people at the same time, minutes | that many people keep going through the steps for that long | "Yes, 200 people were carried for 30 minutes", or "No: trouble began after 12 minutes (95% of steps took up to 11 s)" |
+| **Can it take everyone at once?** | people in the company, the minutes within which they arrive | the number that is there *at the same moment* is worked out (people x one visit's length / the minutes); people are added in 5 steps up to it, each arriving fresh; stops at the first trouble | "Yes, 60,000 people within 30 minutes were carried (1000 at the same moment)", or "No: it coped with about 24,000 of them" |
+| **How many at the same moment?** | the most to try | starts at a tenth and adds a tenth at a time; stops at the first trouble | "About 250 people at the same moment. At 300 trouble began: ..." |
+
+"One visit's length" comes from the last test run. "Trouble" is the line of
+section 5: 95% of steps slower than so many seconds, or more than so many
+percent failing, in two measurements in a row.
+
+The result page puts the answer first, then *What happened over time*: how long
+steps took, how many people were active, failed steps as red dots, and a red
+line where trouble began.
+
+For someone who stays signed in, the first arrival (signing in, loading every
+file for the first time) is much slower than everything after it. It is shown
+per step but does not decide the limit. Where every visit is an arrival (the
+"everyone at once" question), it is exactly what is measured.
+
+### Lightweight users: more people than this machine has browsers for
+
+A browser test with more people than the machine can drive as real browsers
+(about 2.5 per CPU core) runs with **lightweight users** instead - by itself in
+the simple setup, or by choice in the advanced one ("Users are").
+
+- **Test (1 user, once)** in a real browser *records* what each step asks the
+  instance for. A passing test run keeps that recording; after changing a step,
+  test again.
+- In a load run each lightweight user **signs in for real** - ServiceNow builds
+  its sign-in request, this app's identity provider answers, ServiceNow checks
+  the answer and opens a session - and then sends the recorded requests with its
+  own session, its own token and its own user record. ServiceNow gets the same
+  requests as from a browser.
+- A new visitor fetches the page's files (scripts, styles, images); a returning
+  one does not, as with a browser's cache.
+- **What it does not measure:** the browser itself - drawing the page and
+  running its scripts. The times are how long ServiceNow took to answer. A test
+  run with one browser shows the rest.
+- A recorded request that carries something only the recording session had
+  (other than the token, the user and the sign-in ids, which are swapped) may be
+  answered differently; such a request shows up as a failed request of its step.
+- The limit is "Most API users at once" under Capacity and workers (2000 unless
+  changed). One temporary user is created on ServiceNow per lightweight user.
 
 ### A link from an email
 
@@ -320,7 +374,8 @@ instance on the Brazil release.
 ```
 src/server.js     web app: accounts, API, workers' endpoint, /idp/* (mock sign-in)
 src/run.js        a run from checks to cleanup; patterns, limits, the two-hour rule, the janitor
-src/worker.js     browser users and API users; reports timings, screenshots, what each user is doing
+src/replay.js     lightweight users: what is recorded from a browser and how it is sent again
+src/worker.js     browser users, lightweight users and API users; reports timings, screenshots, what each user is doing
 src/provision.js  what is created on the instance and how it is removed
 src/diagnose.js   why steps failed, read from the instance
 src/http.js       requests, directly or through a proxy
