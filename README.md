@@ -220,7 +220,6 @@ site's real values in, and keep that edit out of git
 |---|---|
 | `IMAGE_REGISTRY` | the site's Docker registry prefix, with the trailing slash. The base image is the official Node image from Docker Hub, pulled through it |
 | `APT_MIRROR` | the site's mirror of the Debian package archive (the browser is installed from it). Empty = the image's own source, through the proxy |
-| `APT_SECURITY_MIRROR` | the same for Debian security updates. Empty = the image's own source |
 | `NPM_REGISTRY` | the site's npm mirror |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | the proxy for the build |
 | `CA_BUNDLE_B64` | empty, unless the proxy intercepts TLS: then `base64 -w0 site-ca.pem` |

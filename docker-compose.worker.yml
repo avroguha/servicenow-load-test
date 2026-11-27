@@ -15,7 +15,6 @@ x-build: &build
   args:
     IMAGE_REGISTRY: ${IMAGE_REGISTRY?set IMAGE_REGISTRY in the env file - the site registry prefix with its trailing slash, or empty}
     APT_MIRROR: ${APT_MIRROR?set APT_MIRROR in the env file - the site's Debian mirror, or empty to use the image's own sources}
-    APT_SECURITY_MIRROR: ${APT_SECURITY_MIRROR?set APT_SECURITY_MIRROR in the env file - the site's Debian security mirror, or empty}
     NPM_REGISTRY: ${NPM_REGISTRY?set NPM_REGISTRY in the env file}
     NPM_TOKEN: ${NPM_TOKEN-}
     CA_BUNDLE_B64: ${CA_BUNDLE_B64?set CA_BUNDLE_B64 in the env file - leave it empty unless the proxy intercepts TLS}

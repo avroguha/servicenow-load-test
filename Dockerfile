@@ -23,7 +23,6 @@ FROM ${IMAGE_REGISTRY}${IMAGE_NODE}
 
 # Build-time only. ARG, not ENV: none of these may live on in the image.
 ARG APT_MIRROR=
-ARG APT_SECURITY_MIRROR=
 ARG NPM_REGISTRY=
 ARG NPM_TOKEN=
 ARG CA_BUNDLE_B64=
@@ -32,13 +31,17 @@ ARG HTTPS_PROXY=
 ARG NO_PROXY=localhost,127.0.0.1
 
 # The browser and what the health check needs. With a mirror named, the
-# image's package sources are pointed at it first; without one they are used as
-# they are (through the proxy, when one is set).
+# image's package source is pointed at it and the separate security-updates
+# source is dropped: a site mirror serves the main archive only, and a source
+# that cannot be reached stops the build. Without a mirror the image's sources
+# are used as they are (through the proxy, when one is set).
 RUN set -eu; \
     export http_proxy="${HTTP_PROXY}" https_proxy="${HTTPS_PROXY}" no_proxy="${NO_PROXY}"; \
     src=/etc/apt/sources.list.d/debian.sources; \
-    if [ -n "${APT_SECURITY_MIRROR}" ]; then sed -i "s#https\?://deb.debian.org/debian-security/\?#${APT_SECURITY_MIRROR%/}#" "$src"; fi; \
-    if [ -n "${APT_MIRROR}" ]; then sed -i "s#https\?://deb.debian.org/debian/\?\$#${APT_MIRROR%/}#" "$src"; fi; \
+    if [ -n "${APT_MIRROR}" ]; then \
+      awk -v RS= -v ORS='\n\n' '!/debian-security/' "$src" > "$src.tmp" && mv "$src.tmp" "$src"; \
+      sed -i "s#https\?://deb.debian.org/debian/\?\$#${APT_MIRROR%/}#" "$src"; \
+    fi; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium fonts-liberation ca-certificates curl; \
     rm -rf /var/lib/apt/lists/*; \

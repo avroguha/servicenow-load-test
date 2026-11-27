@@ -20,7 +20,7 @@ test('no site location is written into the image build or the compose file', () 
   // Comments aside, the one public name allowed is the image's own package source inside the sed that REPLACES it with the mirror.
   const code = (text) => text.replace(/^\s*#.*$/gm, '').replace(/sed -i "s#[^"]*"/g, '');
   for (const [name, text] of [['Dockerfile', dockerfile], ['docker-compose.yml', compose]]) assert.ok(!PUBLIC.test(code(text)), `${name} names a public registry`);
-  for (const arg of ['IMAGE_REGISTRY', 'APT_MIRROR', 'APT_SECURITY_MIRROR', 'NPM_REGISTRY', 'NPM_TOKEN', 'CA_BUNDLE_B64', 'HTTP_PROXY', 'HTTPS_PROXY']) assert.match(dockerfile, new RegExp(`^ARG ${arg}=$`, 'm'), `${arg} must default to empty`);
+  for (const arg of ['IMAGE_REGISTRY', 'APT_MIRROR', 'NPM_REGISTRY', 'NPM_TOKEN', 'CA_BUNDLE_B64', 'HTTP_PROXY', 'HTTPS_PROXY']) assert.match(dockerfile, new RegExp(`^ARG ${arg}=$`, 'm'), `${arg} must default to empty`);
   assert.match(dockerfile, /^ARG NO_PROXY=localhost,127\.0\.0\.1$/m);
   assert.match(dockerfile, /\$\{NPM_REGISTRY:\?[^}]+env file/, 'a build without an env file stops with a message');
 });
@@ -64,7 +64,7 @@ test('every build argument the Dockerfile takes is passed by compose, the token 
 test('the env files: placeholders at work, public and no proxy at home, no secret in either', () => {
   for (const k of ['IMAGE_REGISTRY', 'APT_MIRROR', 'NPM_REGISTRY', 'HTTP_PROXY', 'HTTPS_PROXY', 'PUBLIC_HOST']) assert.match(work[k], /avro\.com/, `work.env ${k} must be an avro.com placeholder`);
   assert.match(work.IMAGE_REGISTRY, /^[\w.-]*avro\.com\/$/, 'the registry prefix ends with a slash');
-  assert.strictEqual(home.IMAGE_REGISTRY, ''); assert.strictEqual(home.APT_MIRROR, ''); assert.strictEqual(home.APT_SECURITY_MIRROR, '');
+  assert.strictEqual(home.IMAGE_REGISTRY, ''); assert.strictEqual(home.APT_MIRROR, '');
   assert.match(new URL(work.NPM_REGISTRY).hostname, /(^|\.)avro\.com$/);
   assert.strictEqual(home.HTTP_PROXY, ''); assert.strictEqual(home.HTTPS_PROXY, ''); assert.strictEqual(home.CA_BUNDLE_B64, ''); assert.strictEqual(work.CA_BUNDLE_B64, '', 'an optional input defaults to empty');
   for (const env of [work, home]) for (const [k, v] of Object.entries(env)) assert.ok(!(/TOKEN|PASSWORD|SECRET|KEY/.test(k) && v), `${k} holds a value in an env file`);
@@ -148,4 +148,13 @@ test('the worker compose file follows the same rules, and takes its token from a
   assert.ok(!/^\s*ports:/m.test(wc), 'a worker publishes no port: it only makes outgoing connections');
   assert.match(work.WORKER_CONTROLLER_URL, /^https:\/\/[\w.-]*avro\.com$/);
   assert.strictEqual(work.WORKER_ACCEPT_ANY_CERTIFICATE, '', 'at work the certificate is checked');
+});
+
+test('with a site mirror the build uses only it: the security-updates source is dropped, and there is no setting for it', () => {
+  // A site mirror carries the main archive only; a source that cannot be reached stops apt-get update, and with it the build.
+  const step = dockerfile.slice(dockerfile.indexOf('if [ -n "${APT_MIRROR}" ]; then'), dockerfile.indexOf('apt-get update'));
+  assert.ok(step.includes("'!/debian-security/'"), 'the security-updates stanza is removed when a mirror is named');
+  assert.ok(step.includes('${APT_MIRROR%/}'), 'the main source is pointed at the mirror');
+  assert.ok(step.trim().endsWith('fi; \\'), 'both happen only when a mirror is named');
+  for (const f of ['Dockerfile', 'docker-compose.yml', 'docker-compose.worker.yml', 'work.env', 'home.env', 'README.md']) assert.ok(!/APT_SECURITY_MIRROR/.test(read(f)), `${f} still names a security mirror`);
 });
