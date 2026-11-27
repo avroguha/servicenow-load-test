@@ -18,6 +18,7 @@ x-build: &build
     NPM_REGISTRY: ${NPM_REGISTRY?set NPM_REGISTRY in the env file}
     NPM_TOKEN: ${NPM_TOKEN-}
     CA_BUNDLE_B64: ${CA_BUNDLE_B64?set CA_BUNDLE_B64 in the env file - leave it empty unless the proxy intercepts TLS}
+    MIRROR_SKIP_CERT_CHECK: ${MIRROR_SKIP_CERT_CHECK?set MIRROR_SKIP_CERT_CHECK in the env file - 1 when the package mirrors use a certificate this image does not know, or empty}
     HTTP_PROXY: ${HTTP_PROXY?set HTTP_PROXY in the env file - empty for none}
     HTTPS_PROXY: ${HTTPS_PROXY?set HTTPS_PROXY in the env file - empty for none}
     NO_PROXY: ${NO_PROXY?set NO_PROXY in the env file}

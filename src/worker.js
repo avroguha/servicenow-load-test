@@ -101,7 +101,7 @@ function whyNot(err) {
 // the controller's certificate.
 let relay = null;
 function relayWanted(cfg) {
-  if (cfg.type !== 'ui' || cfg.authMode !== 'sso') return 0;
+  if ((cfg.type !== 'ui' && !cfg.probes) || cfg.authMode !== 'sso') return 0;
   try {
     const u = new URL(cfg.idpBaseUrl);
     if (!['127.0.0.1', 'localhost'].includes(u.hostname) || u.protocol !== 'http:') return 0;   // the browsers reach the app directly
@@ -536,7 +536,7 @@ class VU {
           if (cfg.thinkMs) await this.pause(cfg.thinkMs * (0.75 + Math.random() * 0.5));
         }
         iterations += 1;
-        if (cfg.iterations && iterations >= cfg.iterations) break;
+        if (cfg.iterations && iterations >= cfg.iterations && this.spec.kind !== 'browser') break;
       }
     } catch (err) {
       if (err !== STOP) out.log.push(`${this.spec.user}: ${String(err.message || err).split('\n')[0]}`);
@@ -867,7 +867,17 @@ async function reconcile() {
   }
   for (const spec of desired.vus || []) {
     if (current.vus.has(spec.id)) continue;
-    const v = current.cfg.type === 'api' ? new ApiVU(current, spec) : current.cfg.type === 'http' ? new HttpVU(current, spec) : new VU(current, spec);
+    let v;
+    if (spec.kind === 'browser' && current.cfg.type !== 'ui') {
+      // A real browser measuring beside the lightweight users. If none can be started the run goes on without it, and says so.
+      if (current.noBrowser) continue;
+      if (!current.browser) try { current.browser = await launch(current.cfg); } catch (err) {
+        current.noBrowser = true;
+        out.log.push(`No browser could be started for measuring alongside, so the run has no figure for what a person would see. ${String(err.message).slice(0, 300)}`);
+        continue;
+      }
+      v = new VU(current, spec);
+    } else v = current.cfg.type === 'api' ? new ApiVU(current, spec) : current.cfg.type === 'http' ? new HttpVU(current, spec) : new VU(current, spec);
     current.vus.set(spec.id, v);
     v.task = v.loop();
   }

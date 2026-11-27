@@ -109,3 +109,54 @@ test('the answer is in words, against the question asked, and names when trouble
   assert.match(a.headline, /^At least 500 people at the same moment/);
   assert.strictEqual(answer(base({ question: 'sustain' }, { totals: { n: 0, errors: 0 } })), null, 'a run in which nothing ran has no answer');
 });
+
+// ---- real browsers measuring beside a lightweight run -------------------------
+test('measuring browsers are extra users whose times are kept apart from the load\'s numbers', () => {
+  const { Controller } = require('../src/run');
+  const mk = (load) => normalize({ type: 'ui', users: { prefix: 'lt.' }, steps: [{ type: 'open', url: '/esc' }], load });
+  assert.strictEqual(mk({}).load.probes, 2, 'two by default');
+  assert.strictEqual(mk({ probes: 0 }).load.probes, 0);
+  assert.strictEqual(mk({ probes: 99 }).load.probes, 5, 'never more than five');
+  assert.strictEqual(normalize({ type: 'api', users: { prefix: 'lt.' }, steps: [{ type: 'open', url: '/api/x' }], load: { probes: 3 } }).load.probes, 0, 'an API test has no page to look at');
+
+  const c = new Controller({ port: 0 });
+  clearInterval(c.timer);
+  const r = { kind: 'load', light: 3, probes: 2, config: { sessionMode: 'relogin' }, totals: { n: 0, errors: 0, serverErrors: 0, requests: 0 }, stages: [{ users: 3, n: 0, errors: 0, ms: [] }], bucket: { ms: [], errors: 0, reqs: 0, browserMs: [], browserErrors: 0 },
+    steps: [{ index: 0, name: 'KB', n: 0, errors: 0, ms: [] }], probe: { n: 0, errors: 0, steps: [{ index: 0, name: 'KB', n: 0, errors: 0, ms: [], lastError: '' }] } };
+  c.sample(r, { vu: 1, step: 0, ok: true, ms: 900, requests: 20 });                       // a lightweight user
+  c.sample(r, { vu: 3, step: 0, ok: true, ms: 6000, requests: 90 });                      // the first measuring browser
+  c.sample(r, { vu: 4, step: 0, ok: false, ms: 60000, error: 'the page says: Not Authorized' });
+  assert.deepStrictEqual(r.totals, { n: 1, errors: 0, serverErrors: 0, requests: 20 }, 'the load\'s totals count lightweight users only');
+  assert.deepStrictEqual([r.stages[0].n, r.stages[0].ms, r.stages[0].browserMs], [1, [900], [6000]], 'a browser\'s time never decides the limit');
+  assert.deepStrictEqual([r.probe.n, r.probe.errors, r.probe.steps[0].ms, r.probe.steps[0].lastError], [2, 1, [6000], 'the page says: Not Authorized']);
+  assert.deepStrictEqual([r.bucket.ms, r.bucket.browserMs, r.bucket.browserErrors], [[900], [6000], 1]);
+
+  // They run from the first second to the last, whatever the level, and on a worker of this machine when there is one.
+  const run = fs.readFileSync(path.join(__dirname, '..', 'src', 'run.js'), 'utf8');
+  assert.match(run, /filter\(\(i\) => i < r\.target \|\| \(i >= light && i < r\.users\.length\)\)/);
+  assert.match(run, /const home = ws\.find\(\(x\) => x\.w\.local\) \|\| ws\[0\];/);
+  const w = fs.readFileSync(path.join(__dirname, '..', 'src', 'worker.js'), 'utf8');
+  assert.match(w, /iterations >= cfg\.iterations && this\.spec\.kind !== 'browser'\) break;/, 'a measuring browser does not stop after its passes');
+  assert.match(w, /No browser could be started for measuring alongside[\s\S]{0,200}continue;/, 'without a browser the run goes on, and says so');
+});
+
+test('the answer says what a person would have seen, with few people on and with the most', () => {
+  const sc = normalize({ type: 'ui', users: { prefix: 'lt.' }, steps: [{ type: 'open', url: '/esc' }], load: { mode: 'simple', question: 'parallel', qUsers: 500 } });
+  const base = { kind: 'load', engine: 'http', probes: 2, scenario: sc, totals: { n: 400, errors: 0 }, steps: [{ ms: [1000, 2000] }], series: [], elapsed: 600, limit: null };
+  let a = answer({ ...base, probe: { n: 40, errors: 0 }, stages: [{ users: 50, browser: { n: 10, p50: 4000, p95: 5000 } }, { users: 500, browser: { n: 12, p50: 9000, p95: 14000 } }] });
+  assert.ok(a.facts.some((f) => /measured by 2 real browsers during the run: a step took typically 4\.0 s with 50 people on, and 9\.0 s with 500 \(95% within 14\.0 s\)/.test(f)));
+  a = answer({ ...base, probe: { n: 9, errors: 9 }, stages: [{ users: 50 }] });
+  assert.ok(a.facts.some((f) => /finished no step successfully \(9 failed\)/.test(f)));
+  a = answer({ ...base, probes: 0, probe: null, stages: [{ users: 50 }] });
+  assert.ok(a.facts.some((f) => /The time a browser needs to draw the page comes on top/.test(f)));
+});
+
+test('a worker process that dies during a load run is started again, and its last words are kept', () => {
+  const run = fs.readFileSync(path.join(__dirname, '..', 'src', 'run.js'), 'utf8');
+  assert.match(run, /^const fs = require\('node:fs'\);$/m);
+  // Its error output goes to a file, not a pipe: the last words of a process that dies abruptly are lost in a pipe.
+  assert.match(run, /stdio: \['ignore', 'ignore', fd\]/);
+  assert.match(run, /worker-\$\{name\}\.log/);
+  assert.match(run, /if \(r\.kind !== 'build' && r\.restarts <= 3 && !r\.stopAsked\) \{[\s\S]{0,400}startOne\(name\);/, 'started again, three times at most, never for a one-user test');
+  assert.match(run, /was started again \$\{r\.restarts\} time/, 'and the answer says that it happened');
+});

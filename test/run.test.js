@@ -263,3 +263,40 @@ test('the sign-in pages are answered on the worker\'s own machine, so the record
   assert.match(w, /srv\.listen\(port, '127\.0\.0\.1'/, 'the relay listens on loopback only');
   assert.match(w, /if \(!req\.url\.startsWith\('\/idp\/'\)\)/, 'and passes on nothing but the sign-in pages');
 });
+
+// ---- deleting a test ---------------------------------------------------------
+test('a deleted test goes to the recycle bin, can be put back, and is removed for good after 180 days', () => {
+  const day = 86400000; const t0 = Date.UTC(2026, 0, 1);
+  store.saveScenarios([{ id: 'aa01', name: 'Keep me' }, { id: 'aa02', name: 'Old test' }, { id: 'aa03', name: 'Another' }]);
+  store.write('recording-aa02.json', { steps: [] });
+  assert.strictEqual(store.BIN_DAYS, 180);
+  assert.ok(store.binScenario('aa02', 'admin', t0));
+  assert.deepStrictEqual(store.scenarios().map((x) => x.id), ['aa01', 'aa03'], 'a deleted test is no longer among the tests');
+  assert.deepStrictEqual(store.binned().map((x) => [x.id, x.deletedBy, x.deletedAt]), [['aa02', 'admin', t0]]);
+  assert.strictEqual(store.binScenario('aa02', 'admin'), null, 'it cannot be deleted twice');
+  // Saving the tests in use (what every edit does) must not empty the recycle bin.
+  store.saveScenarios(store.scenarios().filter((x) => x.id !== 'aa03'));
+  assert.deepStrictEqual(store.binned().map((x) => x.id), ['aa02']);
+  // Still there one day before the end, gone on the day.
+  assert.deepStrictEqual(store.purgeOldScenarios(t0 + 179 * day), []);
+  assert.ok(store.read('recording-aa02.json', null), 'what was recorded for it is kept while it can be put back');
+  // Put back: it is a test again; a name taken meanwhile is told apart.
+  store.saveScenarios([...store.scenarios(), { id: 'aa04', name: 'Old test' }]);
+  assert.strictEqual(store.restoreScenario('aa02').name, 'Old test (restored)');
+  assert.ok(store.scenarios().some((x) => x.id === 'aa02' && !x.deletedAt && !x.deletedBy));
+  assert.strictEqual(store.restoreScenario('aa02'), null);
+  // Deleted again and left: removed for good after 180 days, with its recording. A test in use is never removed this way.
+  store.binScenario('aa02', 'admin', t0);
+  assert.strictEqual(store.purgeScenario('aa01'), false, 'only what is in the recycle bin can be removed for good');
+  assert.deepStrictEqual(store.purgeOldScenarios(t0 + 180 * day), ['Old test (restored)']);
+  assert.deepStrictEqual(store.binned(), []);
+  assert.strictEqual(store.read('recording-aa02.json', null), null);
+  assert.deepStrictEqual(store.scenarios().map((x) => x.id).sort(), ['aa01', 'aa04']);
+  store.saveScenarios([]);
+  const srv = fs.readFileSync(path.join(root, 'src', 'server.js'), 'utf8');
+  assert.match(srv, /store\.binScenario\(sm\[1\], me\.name\)/, 'the delete request moves the test to the recycle bin');
+  assert.match(srv, /sweeping = true;\n  try \{ store\.purgeOldScenarios\(\)/, 'the periodic job empties what is older than 180 days');
+  const ui = fs.readFileSync(path.join(root, 'public', 'app.js'), 'utf8');
+  assert.match(ui, /data-bin="\$\{t\.id\}"/, 'every test in the list has its own Delete button');
+  assert.match(ui, /data-unbin=/); assert.match(ui, /data-forever=/);
+});

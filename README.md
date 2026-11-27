@@ -73,6 +73,10 @@ That is the way to try it on one machine. To run it for a team, see
 
 **Save**, then **Test (1 user, once)**. When that is green, **Run load test**.
 
+### Deleting a test
+
+Every test in the list has a **Delete** button (the editor has one too). A deleted test goes to the **Recycle bin** at the bottom of the Tests page: it can be put back for 180 days and is removed for good after that, automatically, together with what was recorded for it. Past runs of a deleted test stay in History. A test that is running cannot be deleted - stop the run first.
+
 ### The three questions (simple setup)
 
 | Question | You give | What runs | The answer |
@@ -110,9 +114,16 @@ the simple setup, or by choice in the advanced one ("Users are").
   requests as from a browser.
 - A new visitor fetches the page's files (scripts, styles, images); a returning
   one does not, as with a browser's cache.
-- **What it does not measure:** the browser itself - drawing the page and
-  running its scripts. The times are how long ServiceNow took to answer. A test
-  run with one browser shows the rest.
+- **Real browsers measure alongside.** Lightweight users show how long
+  ServiceNow takes to answer, not what a person waits for: drawing the page
+  and running its scripts happens in a browser. So two real browsers (0 to 5,
+  under Advanced) go through the same steps from the first second of the run to
+  the last, each with its own temporary user. Their times are shown apart - a
+  green line on the chart, a column per level, a table of their own, and a
+  sentence in the answer ("a step took typically 4 s with 50 people on, and 9 s
+  with 500") - and never count towards the limit or the load's totals. They run
+  on the app's own machine when a worker is there. If no browser can be
+  started the run goes on without them and says so.
 - A recorded request that carries something only the recording session had
   (other than the token, the user and the sign-in ids, which are swapped) may be
   answered differently; such a request shows up as a failed request of its step.
@@ -277,6 +288,7 @@ site's real values in, and keep that edit out of git
 | `NPM_REGISTRY` | the site's npm mirror |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | the proxy for the build |
 | `CA_BUNDLE_B64` | empty, unless the proxy intercepts TLS: then `base64 -w0 site-ca.pem` |
+| `MIRROR_SKIP_CERT_CHECK` | `1` = the build does not check the HTTPS certificate of `APT_MIRROR` and `NPM_REGISTRY` (internal mirrors with a certificate from the site's own authority). The packages are still verified: apt by the archive's signature, npm by the lock file's hashes. Empty = checked |
 | `STATE_DIR` | the folder that keeps settings, results and the certificate (default `../uiload-state`, beside the project, so replacing the code never touches it) |
 | `PUBLIC_HOST` | the name people type in the browser |
 | `TLS_NAMES` | more names for the first, self-signed certificate; may be empty |

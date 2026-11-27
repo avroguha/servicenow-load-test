@@ -100,6 +100,7 @@ let sweeping = false;
 async function sweep() {
   if (sweeping) return;
   sweeping = true;
+  try { store.purgeOldScenarios(); } catch { /* next round */ }
   try { await janitor(ctl.busy() ? ctl.run.id : ''); } catch { /* no credentials yet, or the instance is away: next round */ }
   sweeping = false;
 }
@@ -206,8 +207,17 @@ async function api(req, res, url) {
     if (sc.instance && !s.instances.some((i) => i.id === sc.instance)) problems.push('The ServiceNow instance chosen for this test is no longer configured.');
     return send(res, 200, { scenario: sc, problems, plan: plan(sc) });
   }
+  // Deleting a test puts it in the recycle bin; from there it can be put back, or removed for good.
+  if (p === '/api/scenarios/bin' && m === 'GET') return send(res, 200, { days: store.BIN_DAYS, tests: store.binned().map((s) => ({ id: s.id, name: s.name, type: s.type, deletedAt: s.deletedAt, deletedBy: s.deletedBy || '', goesAt: s.deletedAt + store.BIN_DAYS * 86400000 })) });
   const sm = p.match(/^\/api\/scenarios\/([a-f0-9]+)$/);
-  if (sm && m === 'DELETE') { store.saveScenarios(store.scenarios().filter((x) => x.id !== sm[1])); return send(res, 200, { ok: true }); }
+  if (sm && m === 'DELETE') {
+    if (ctl.busy() && ctl.run.scenario && ctl.run.scenario.id === sm[1]) return send(res, 409, { error: 'This test is running now. Stop the run first, then delete the test.' });
+    if (!store.binScenario(sm[1], me.name)) return send(res, 404, { error: 'This test no longer exists.' });
+    return send(res, 200, { ok: true, days: store.BIN_DAYS });
+  }
+  const bm = p.match(/^\/api\/scenarios\/([a-f0-9]+)\/(restore|forever)$/);
+  if (bm && bm[2] === 'restore' && m === 'POST') { const sc = store.restoreScenario(bm[1]); return sc ? send(res, 200, { ok: true, name: sc.name }) : send(res, 404, { error: 'This test is not in the recycle bin.' }); }
+  if (bm && bm[2] === 'forever' && m === 'DELETE') return store.purgeScenario(bm[1]) ? send(res, 200, { ok: true }) : send(res, 404, { error: 'This test is not in the recycle bin.' });
 
   // ---- runs ----
   if (p === '/api/status') return send(res, 200, ctl.status());

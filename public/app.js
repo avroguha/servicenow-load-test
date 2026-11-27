@@ -118,12 +118,17 @@ function runsTable(runs) {
 
 // ---- tests ---------------------------------------------------------------------
 async function pageTests() {
-  tests = await api('GET', '/api/scenarios');
+  let bin;
+  [tests, bin] = await Promise.all([api('GET', '/api/scenarios'), api('GET', '/api/scenarios/bin')]);
   view.innerHTML = head('Tests', 'A test is a list of steps, the users that perform them, and how the load is applied.', '<a class="btn primary" href="#/tests/new">New test</a>')
     + `<div class="card">${tests.length ? `<table><tr><th>Name</th><th>Instance</th><th>Type</th><th>Sign-in</th><th>Steps</th><th>Load</th><th>By</th><th></th></tr>
       ${tests.map((t) => `<tr class="click" data-go="#/tests/${t.id}"><td><b>${esc(t.name)}</b></td><td>${esc((instOf(t.instance) || {}).name || '')}</td><td><span class="tag">${t.type === 'api' ? 'API' : 'Browser'}</span></td><td>${esc(AUTH[t.authMode])}</td>
-        <td>${t.steps.filter((s) => s.type !== 'wait').length}</td><td>${esc(loadText(t))}</td><td>${esc(t.createdBy || '')}</td><td class="r"><span class="link">Open</span></td></tr>`).join('')}</table>`
-    : '<div class="empty">No tests yet.<br><br><a class="btn primary" href="#/tests/new">Create the first one</a></div>'}</div>`;
+        <td>${t.steps.filter((s) => s.type !== 'wait').length}</td><td>${esc(loadText(t))}</td><td>${esc(t.createdBy || '')}</td><td class="r"><span class="row" style="justify-content:flex-end;flex-wrap:nowrap"><span class="link">Open</span><button class="btn small danger" data-bin="${t.id}" data-name="${esc(t.name)}">Delete</button></span></td></tr>`).join('')}</table>`
+    : '<div class="empty">No tests yet.<br><br><a class="btn primary" href="#/tests/new">Create the first one</a></div>'}</div>`
+    + (bin.tests.length ? `<div class="card"><h2>Recycle bin</h2><p class="hint">Deleted tests are kept here for ${bin.days} days and can be put back. After that they are removed for good, automatically. Past runs of a deleted test stay in History.</p>
+      <table><tr><th>Name</th><th>Type</th><th>Deleted</th><th>Removed for good on</th><th></th></tr>
+      ${bin.tests.map((t) => `<tr><td><b>${esc(t.name)}</b></td><td><span class="tag">${t.type === 'api' ? 'API' : 'Browser'}</span></td><td>${fmtTime(t.deletedAt)}${t.deletedBy ? `<br><small class="muted">by ${esc(t.deletedBy)}</small>` : ''}</td><td>${new Date(t.goesAt).toLocaleDateString([], { dateStyle: 'medium' })}</td>
+        <td class="r"><span class="row" style="justify-content:flex-end;flex-wrap:nowrap"><button class="btn small" data-unbin="${t.id}">Put back</button><button class="btn small danger" data-forever="${t.id}" data-name="${esc(t.name)}">Delete for good</button></span></td></tr>`).join('')}</table></div>` : '');
 }
 const AUTH = { sso: 'Mock SSO', local: 'User name and password', basic: 'Basic authentication', oauth: 'OAuth token' };
 function loadText(t) {
@@ -151,7 +156,7 @@ const QUESTION = { sustain: 'Steady load', surge: 'Everyone at once', parallel: 
 const blank = () => ({
   id: '', name: '', type: 'ui', instance: (insts()[0] || {}).id || '', proxy: '(connection)', authMode: 'sso', users: { prefix: 'lt.user.', roles: [], groups: [] },
   steps: [{ type: 'open', name: '', url: '' }],
-  load: { mode: 'simple', question: 'sustain', qUsers: 20, qMinutes: 10, qPeople: 1000, visitSeconds: 30, engine: 'auto', pattern: 'ramp', users: 5, durationSeconds: 300, passes: 1, startUsers: 1, stepUsers: 1, stepSeconds: 60, maxUsers: 5, holdSeconds: 60, thinkSeconds: 3, sessionMode: 'keep', entry: 'link', usersPerWorker: 5, localWorkers: 'auto', timeoutSeconds: 60 },
+  load: { mode: 'simple', question: 'sustain', qUsers: 20, qMinutes: 10, qPeople: 1000, visitSeconds: 30, engine: 'auto', probes: 2, pattern: 'ramp', users: 5, durationSeconds: 300, passes: 1, startUsers: 1, stepUsers: 1, stepSeconds: 60, maxUsers: 5, holdSeconds: 60, thinkSeconds: 3, sessionMode: 'keep', entry: 'link', usersPerWorker: 5, localWorkers: 'auto', timeoutSeconds: 60 },
   limit: { p95Ms: 8000, errorPct: 5, action: 'pause' },
 });
 
@@ -212,8 +217,9 @@ function drawEditor() {
   const capNow = eng === 'ui' ? lim.maxBrowsers : lim.maxApiUsers;
   const who = eng === 'api' ? 'API user' : eng === 'http' ? 'lightweight user' : 'browser';
   const rec = ed.recorded;
+  const probes = eng === 'http' ? Math.min(5, Math.max(0, Math.floor(l.probes == null || l.probes === '' ? 2 : +l.probes || 0)), lim.maxBrowsers || 0) : 0;
   const engineNote = eng !== 'http' ? ''
-    : `<div class="banner ${rec ? 'info' : 'limit'}" style="font-weight:400"><b>Runs with lightweight users.</b> ${peak} at the same moment is more than the ${lim.maxBrowsers} real browsers this machine can drive, so each user sends the requests a browser made, with its own sign-in and session, without opening a browser. ServiceNow gets the same requests; what is not measured is the time a browser needs to draw the page.
+    : `<div class="banner ${rec ? 'info' : 'limit'}" style="font-weight:400"><b>Runs with lightweight users.</b> ${peak} at the same moment is more than the ${lim.maxBrowsers} real browsers this machine can drive, so each user sends the requests a browser made, with its own sign-in and session, without opening a browser. ServiceNow gets the same requests. ${probes ? `<b>${plural(probes, 'real browser')}</b> ${probes > 1 ? 'go' : 'goes'} through the same steps during the whole run, to measure what a person would see.` : 'No real browser measures alongside, so the time a browser needs to draw the page is not measured.'}
         <small>${rec ? `Recorded by the test run of ${fmtTime(rec.at)}: ${rec.requests} requests per visit, one visit takes about ${rec.visitSeconds || l.visitSeconds} s. Test again after changing a step.` : 'Nothing is recorded yet: press <b>Test (1 user, once)</b> first. A passing test run records what the browser asks for.'}</small></div>`;
   h.push(`<div class="card"><h2>4. Load</h2>
     ${api_ ? '' : `<div class="seg" style="margin-bottom:14px"><button type="button" class="${simple ? 'on' : ''}" data-choice="load.mode" data-v="simple">Simple</button><button type="button" class="${simple ? '' : 'on'}" data-choice="load.mode" data-v="advanced">Advanced</button></div>`}
@@ -243,11 +249,12 @@ function drawEditor() {
       ${api_ ? '' : sel('load.sessionMode', 'Session', [['keep', 'Sign in once and keep going'], ['relogin', 'Arrive fresh for every pass']])}
       ${api_ || ed.authMode !== 'sso' ? '' : sel('load.entry', 'Arrival', [['home', 'Sign in first, then the steps'], ['link', 'Click the first link with no session']], 'The second is someone clicking a link in an email.')}
       ${api_ ? '' : sel('load.engine', 'Users are', [['auto', 'Chosen for me: browsers while this machine can, lightweight users beyond'], ['browser', 'Real browsers'], ['http', 'Lightweight users (recorded requests, no browser)']], 'Lightweight users reach thousands from one machine.')}
+      ${api_ || eng !== 'http' ? '' : inp('load.probes', 'Real browsers measuring alongside (0 to 5)', { type: 'number', min: 0, hint: 'They do the same steps during a lightweight run and show what a person would see. Their times do not count towards the limit.' })}
     </div>`}
     ${engineNote}
     <div class="banner ${peak > capNow ? 'bad' : 'info'}" style="font-weight:400">${peak > capNow
     ? `<b>${peak} ${who}s at the same moment is above the limit of ${capNow}.</b> ${eng === 'ui' ? `This machine has ${lim.cores} cores; more browsers than that would measure the test machine, not ServiceNow.` : ''} ${me.role === 'admin' ? 'Change it under <a href="#/admin/capacity">Capacity and workers</a>.' : 'An administrator can raise it.'}`
-    : `Most at the same moment: <b>${plural(peak || 0, who)}</b> of ${capNow} allowed. ${plural(peak || 0, 'temporary user')} will be created on ServiceNow and removed afterwards.`}</div></div>`);
+    : `Most at the same moment: <b>${plural(peak || 0, who)}</b> of ${capNow} allowed. ${plural((peak || 0) + probes, 'temporary user')} will be created on ServiceNow and removed afterwards${probes ? ` (${probes} of them for the measuring browser${probes > 1 ? 's' : ''})` : ''}.`}</div></div>`);
 
   h.push(`<div class="card"><h2>5. When is it too slow?</h2><p class="hint">The line between "fine" and "trouble". The answer at the end is measured against it.</p>
     <div class="grid">${inp('limit.p95Ms', '95% of steps slower than (ms)', { type: 'number', min: 0 })}${inp('limit.errorPct', 'Or more failed steps than (%)', { type: 'number', min: 0, step: '0.5' })}
@@ -267,7 +274,7 @@ function drawEditor() {
     if (!confirm(`Run "${t.name}"?\n\n${plural(n, 'temporary user')} will be created on ${(instOf(t.instance) || {}).url || 'the instance'} and removed when the run ends.`)) return;
     await api('POST', '/api/run', { scenarioId: t.id, kind: 'load' }); location.hash = '#/run';
   });
-  if (ed.id) $('edDelete').onclick = guard(async () => { if (!confirm(`Delete the test "${ed.name}"? Its past runs stay in History.`)) return; await api('DELETE', `/api/scenarios/${ed.id}`); location.hash = '#/tests'; });
+  if (ed.id) $('edDelete').onclick = guard(async () => { if (!confirm(`Delete the test "${ed.name}"?\n\nIt goes to the recycle bin on the Tests page and can be put back for 180 days. Its past runs stay in History.`)) return; await api('DELETE', `/api/scenarios/${ed.id}`); location.hash = '#/tests'; });
 }
 function stepsHtml() {
   const api_ = ed.type === 'api';
@@ -291,7 +298,7 @@ view.addEventListener('input', (e) => {
   if (d.k && ed) { set(ed, d.k, e.target.value); if (['load.maxUsers', 'load.users'].includes(d.k) && e.type === 'change') drawEditor(); }
   if (d.s !== undefined && ed) { ed.steps[+d.s][d.sk] = e.target.value; if (d.sk === 'method') $('steps').innerHTML = stepsHtml(); }
 });
-view.addEventListener('change', (e) => { const d = e.target.dataset; if (ed && d.k && ['load.maxUsers', 'load.users', 'users.prefix', 'load.durationSeconds', 'instance', 'load.qUsers', 'load.qMinutes', 'load.qPeople', 'load.engine'].includes(d.k)) drawEditor(); });
+view.addEventListener('change', (e) => { const d = e.target.dataset; if (ed && d.k && ['load.maxUsers', 'load.users', 'users.prefix', 'load.durationSeconds', 'instance', 'load.qUsers', 'load.qMinutes', 'load.qPeople', 'load.engine', 'load.probes'].includes(d.k)) drawEditor(); });
 async function saveTest(strict) {
   if (!String(ed.name || '').trim()) throw new Error('Give the test a name.');
   const out = await api('PUT', '/api/scenarios', ed);
@@ -329,7 +336,7 @@ function runHtml(r, workers, isLive) {
 
   h.push(`<div class="card"><div class="steps-flow">${PHASES.map(([k, label], i) => `<span class="phase ${i < at || r.state === 'done' ? 'done' : i === at ? 'on' : ''}">${label}</span>`).join('')}</div>
     ${r.kind === 'load' && r.planSeconds ? `<div class="progress"><i style="width:${Math.min(100, (100 * r.elapsed) / r.planSeconds).toFixed(1)}%"></i></div><p class="hint" style="margin:6px 0 0">${fmtDur(r.elapsed)} of ${fmtDur(r.planSeconds)} planned</p>` : ''}
-    <dl class="kv" style="margin-top:12px"><dt>Instance</dt><dd>${r.instance ? `<b>${esc(r.instance.name)}</b> <code>${esc(r.instance.url)}</code>${r.instance.proxy ? ` through proxy ${esc(r.instance.proxy)}` : ''}` : ''}</dd><dt>Type</dt><dd>${api_ ? 'API' : r.engine === 'http' ? 'Lightweight users (recorded browser requests)' : 'Browser'} · ${esc(AUTH[sc.authMode])}${r.kind === 'load' ? ` · ${esc(loadText(sc))}` : ''}</dd>
+    <dl class="kv" style="margin-top:12px"><dt>Instance</dt><dd>${r.instance ? `<b>${esc(r.instance.name)}</b> <code>${esc(r.instance.url)}</code>${r.instance.proxy ? ` through proxy ${esc(r.instance.proxy)}` : ''}` : ''}</dd><dt>Type</dt><dd>${api_ ? 'API' : r.engine === 'http' ? `Lightweight users (recorded browser requests)${r.probes ? ` + ${plural(r.probes, 'real browser')} measuring` : ''}` : 'Browser'} · ${esc(AUTH[sc.authMode])}${r.kind === 'load' ? ` · ${esc(loadText(sc))}` : ''}</dd>
       <dt>Started</dt><dd>${fmtTime(r.createdAt)}${r.by ? ` by ${esc(r.by)}` : ''} · run ${esc(r.id)}</dd>
       <dt>On the instance</dt><dd>${r.cleanup ? (r.cleanup.complete ? `<span class="pill good">removed</span> ${r.cleanup.deleted} record(s) deleted, nothing left` : `<span class="pill bad">cleanup pending</span> ${(r.cleanup.remaining || []).length} record(s) may remain - retried automatically <button class="btn small" data-clean="${r.id}">Clean up now</button>`)
     : r.ledger ? `${plural(r.ledger, 'record')} created for this run · removed when it ends, and no later than ${new Date(r.removeBy).toLocaleTimeString([], { timeStyle: 'short' })}` : 'nothing created yet'}</dd></dl>
@@ -352,7 +359,7 @@ function runHtml(r, workers, isLive) {
   if (r.startedAt) {
     const sp = r.speed;
     h.push(`<div class="tiles">
-      <div class="tile"><b>${r.active} / ${r.target}</b><span>users active / planned now</span></div>
+      <div class="tile"><b>${Math.max(0, r.active - (r.probes || 0))} / ${r.target}</b><span>users active / planned now${r.probes ? ` (+ ${plural(r.probes, 'measuring browser')})` : ''}</span></div>
       <div class="tile"><b>${sp ? sp.rate : 0}</b><span>steps finished per minute</span></div>
       <div class="tile"><b>${sp ? sp.reqs : 0}</b><span>${api_ ? 'requests' : 'browser requests'} per second</span></div>
       <div class="tile"><b>${sp && sp.avg ? fmtMs(sp.avg) : '-'}</b><span>average step, last 5 s</span></div>
@@ -375,12 +382,16 @@ function runHtml(r, workers, isLive) {
   }
 
   if (r.kind === 'load' && r.series && r.series.length) {
-    h.push(`<div class="card"><h2>What happened over time</h2><p class="hint">Left scale: how long steps took. Right scale: people active. Red dots: failed steps. ${r.answer && r.answer.trouble ? `The red vertical line is where trouble began (${fmtDur(r.answer.trouble.t)} in, ${r.answer.trouble.users} people active).` : ''}</p><canvas></canvas>
-      <div class="legend"><span><i style="background:var(--accent)"></i>95% of steps faster than</span><span><i style="background:var(--chart2)"></i>users active</span><span><i style="background:var(--bad)"></i>failed steps</span><span><i style="background:var(--bad);height:1px"></i>your limit</span></div></div>`);
+    h.push(`<div class="card"><h2>What happened over time</h2><p class="hint">Left scale: how long steps took${r.probes ? ' - the blue line for the lightweight users (how long ServiceNow took to answer), the green line for a real browser (what a person would see)' : ''}. Right scale: people active. Red dots: failed steps. ${r.answer && r.answer.trouble ? `The red vertical line is where trouble began (${fmtDur(r.answer.trouble.t)} in, ${r.answer.trouble.users} people active).` : ''}</p><canvas></canvas>
+      <div class="legend"><span><i style="background:var(--accent)"></i>95% of steps faster than</span><span><i style="background:var(--chart2)"></i>users active</span>${r.probes ? '<span><i style="background:var(--good)"></i>a real browser, typical step</span>' : ''}<span><i style="background:var(--bad)"></i>failed steps</span><span><i style="background:var(--bad);height:1px"></i>your limit</span></div></div>`);
   }
   if (r.kind === 'load' && r.stages && r.stages.length > 1) {
-    h.push(`<div class="card"><h2>By number of users</h2><table><tr><th>Users</th><th class="r">Steps</th><th class="r">Failed</th><th class="r">Average</th><th class="r">Half faster than</th><th class="r">95% faster than</th><th class="r">Slowest</th><th></th></tr>
-      ${r.stages.map((s) => `<tr class="${s.breach ? 'bad' : ''}"><td><b>${s.users}</b></td><td class="r">${s.n}</td><td class="r">${s.errors}${s.n ? ` (${((100 * s.errors) / s.n).toFixed(1)}%)` : ''}</td><td class="r">${fmtMs(s.avg)}</td><td class="r">${fmtMs(s.p50)}</td><td class="r">${fmtMs(s.p95)}</td><td class="r">${fmtMs(s.max)}</td><td>${s.breach ? esc(s.breach) : (s.closed ? '' : 'in progress')}${s.busy ? ' · generator at full CPU' : ''}</td></tr>`).join('')}</table></div>`);
+    h.push(`<div class="card"><h2>By number of users</h2><table><tr><th>Users</th><th class="r">Steps</th><th class="r">Failed</th><th class="r">Average</th><th class="r">Half faster than</th><th class="r">95% faster than</th><th class="r">Slowest</th>${r.probes ? '<th class="r">A real browser, typical</th>' : ''}<th></th></tr>
+      ${r.stages.map((s) => `<tr class="${s.breach ? 'bad' : ''}"><td><b>${s.users}</b></td><td class="r">${s.n}</td><td class="r">${s.errors}${s.n ? ` (${((100 * s.errors) / s.n).toFixed(1)}%)` : ''}</td><td class="r">${fmtMs(s.avg)}</td><td class="r">${fmtMs(s.p50)}</td><td class="r">${fmtMs(s.p95)}</td><td class="r">${fmtMs(s.max)}</td>${r.probes ? `<td class="r">${s.browser ? fmtMs(s.browser.p50) : ''}</td>` : ''}<td>${s.breach ? esc(s.breach) : (s.closed ? '' : 'in progress')}${s.busy ? ' · generator at full CPU' : ''}</td></tr>`).join('')}</table></div>`);
+  }
+  if (r.probe && r.probe.n) {
+    h.push(`<div class="card"><h2>What a person would have seen</h2><p class="hint">${plural(r.probes, 'real browser')} went through the same steps during the run, timed until the page had stopped loading. These times are not part of the load's numbers and do not count towards the limit.</p><table><tr><th>Step</th><th class="r">Times</th><th class="r">Failed</th><th class="r">Half faster than</th><th class="r">95% faster than</th><th class="r">Slowest</th><th>Last error</th></tr>
+      ${r.probe.steps.filter((s) => s.n).map((s) => `<tr class="${s.errors ? 'bad' : ''}"><td>${s.index < 0 ? '' : `${s.index + 1}. `}<b>${esc(s.name)}</b></td><td class="r">${s.n}</td><td class="r">${s.errors}</td><td class="r">${fmtMs(s.p50)}</td><td class="r">${fmtMs(s.p95)}</td><td class="r">${fmtMs(s.max)}</td><td>${esc(s.lastError || '')}</td></tr>`).join('')}</table></div>`);
   }
   if (r.steps && r.steps.some((s) => s.n)) {
     h.push(`<div class="card"><h2>By step</h2><table><tr><th>Step</th><th class="r">Times</th><th class="r">Failed</th><th class="r">Average</th><th class="r">Half faster than</th><th class="r">95% faster than</th><th class="r">Slowest</th><th>Last error</th></tr>
@@ -414,7 +425,7 @@ function drawChart(cv, r) {
   const L = 62; const R = 40; const T = 10; const B = 24;
   const all = r.series;
   const maxT = Math.max(all[all.length - 1].t, r.planSeconds || 0, 10);
-  const maxMs = Math.max(...all.map((p) => p.p95), r.scenario.limit.p95Ms || 0, 100) * 1.1;
+  const maxMs = Math.max(...all.map((p) => p.p95), ...all.map((p) => p.browser || 0), r.scenario.limit.p95Ms || 0, 100) * 1.1;
   const maxU = Math.max(...all.map((p) => p.users), r.target || 0, 1);
   const x = (t) => L + ((W - L - R) * t) / maxT;
   const yMs = (v) => H - B - ((H - T - B) * v) / maxMs;
@@ -438,6 +449,14 @@ function drawChart(cv, r) {
   };
   line('users', yU, col('--chart2'), true);
   line('p95', yMs, col('--accent'), false);
+  if (r.probes) {
+    // what a real browser showed at the same time: only where a browser finished a step
+    const pts = all.filter((p) => p.browserN > 0);
+    g.strokeStyle = col('--good'); g.lineWidth = 2; g.beginPath();
+    pts.forEach((p, i) => { if (!i) g.moveTo(x(p.t), yMs(p.browser)); else g.lineTo(x(p.t), yMs(p.browser)); });
+    g.stroke();
+    g.fillStyle = col('--good'); pts.forEach((p) => { g.beginPath(); g.arc(x(p.t), yMs(p.browser), 2.5, 0, 7); g.fill(); });
+  }
   const tr = r.answer && r.answer.trouble;
   if (tr) { g.strokeStyle = col('--bad'); g.lineWidth = 2; g.beginPath(); g.moveTo(x(tr.t), T); g.lineTo(x(tr.t), H - B); g.stroke(); g.fillStyle = col('--bad'); g.textAlign = x(tr.t) > W - 160 ? 'right' : 'left'; g.fillText(' trouble began ', x(tr.t), T + 12); }
   g.fillStyle = col('--bad');
@@ -590,6 +609,9 @@ document.body.addEventListener('click', guard(async (e) => {
   }
   if (d.run) { await api('POST', `/api/run/${d.run}`); return; }
   if (d.clean) { t.disabled = true; t.textContent = 'Cleaning up...'; const out = await api('POST', `/api/runs/${d.clean}/cleanup`); toast(out.complete ? 'Removed from the instance.' : 'Some records could not be removed yet.', !out.complete); status = await api('GET', '/api/status'); refreshBadge(); route(); return; }
+  if (d.bin) { if (confirm(`Delete the test "${d.name}"?\n\nIt goes to the recycle bin below and can be put back for 180 days. Its past runs stay in History.`)) { await api('DELETE', `/api/scenarios/${d.bin}`); toast('Moved to the recycle bin.'); pageTests(); } return; }
+  if (d.unbin) { const out = await api('POST', `/api/scenarios/${d.unbin}/restore`); toast(`Put back: ${out.name}`); pageTests(); return; }
+  if (d.forever) { if (confirm(`Remove the test "${d.name}" for good? This cannot be undone.`)) { await api('DELETE', `/api/scenarios/${d.forever}/forever`); pageTests(); } return; }
   if (d.rmrun) { if (confirm('Delete this run\'s results and screenshots from this app?')) { await api('DELETE', `/api/runs/${d.rmrun}`); location.hash = '#/history'; } return; }
   if (d.rmuser) { if (confirm(`Remove ${d.rmuser}?`)) { await api('DELETE', `/api/users/${d.rmuser}`); pagePeople(); } return; }
   if (go && !t.closest('button')) location.hash = go.dataset.go;

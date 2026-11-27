@@ -26,6 +26,7 @@ ARG APT_MIRROR=
 ARG NPM_REGISTRY=
 ARG NPM_TOKEN=
 ARG CA_BUNDLE_B64=
+ARG MIRROR_SKIP_CERT_CHECK=
 ARG HTTP_PROXY=
 ARG HTTPS_PROXY=
 ARG NO_PROXY=localhost,127.0.0.1
@@ -35,6 +36,11 @@ ARG NO_PROXY=localhost,127.0.0.1
 # source is dropped: a site mirror serves the main archive only, and a source
 # that cannot be reached stops the build. Without a mirror the image's sources
 # are used as they are (through the proxy, when one is set).
+# MIRROR_SKIP_CERT_CHECK=1: the mirror's HTTPS certificate is not checked - for
+# a site mirror whose certificate comes from an authority this image does not
+# know (the slim image knows none before this step). The packages themselves
+# are still checked: apt verifies the archive's signature whatever the
+# connection. The setting is removed again in this same step.
 RUN set -eu; \
     export http_proxy="${HTTP_PROXY}" https_proxy="${HTTPS_PROXY}" no_proxy="${NO_PROXY}"; \
     src=/etc/apt/sources.list.d/debian.sources; \
@@ -42,9 +48,12 @@ RUN set -eu; \
       awk -v RS= -v ORS='\n\n' '!/debian-security/' "$src" > "$src.tmp" && mv "$src.tmp" "$src"; \
       sed -i "s#https\?://deb.debian.org/debian/\?\$#${APT_MIRROR%/}#" "$src"; \
     fi; \
+    if [ "${MIRROR_SKIP_CERT_CHECK}" = "1" ]; then \
+      printf '%s\n' 'Acquire::https::Verify-Peer "false";' 'Acquire::https::Verify-Host "false";' > /etc/apt/apt.conf.d/99-mirror-no-cert-check; \
+    fi; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium fonts-liberation ca-certificates curl; \
-    rm -rf /var/lib/apt/lists/*; \
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/99-mirror-no-cert-check; \
     chromium --version
 
 WORKDIR /app
@@ -54,11 +63,14 @@ COPY scripts/check-release-age.js scripts/check-release-age.js
 # One step: configure npm for this site, install exactly the lock file, refuse
 # anything published in the last 72 hours (from the committed publish-time
 # record - no registry lookup), then remove every trace of the site settings.
+# With MIRROR_SKIP_CERT_CHECK=1 npm does not check the registry's certificate
+# either; what it installs is still checked against the lock file's hashes.
 RUN set -eu; \
     : "${NPM_REGISTRY:?NPM_REGISTRY is empty - build with an env file: docker compose --env-file work.env (or home.env) up --build -d}"; \
     export http_proxy="${HTTP_PROXY}" https_proxy="${HTTPS_PROXY}" no_proxy="${NO_PROXY}"; \
     npm config set registry "${NPM_REGISTRY}"; \
     if [ -n "${NPM_TOKEN}" ]; then npm config set "$(printf '%s' "${NPM_REGISTRY}" | sed -E 's#^https?:##')/:_authToken" "${NPM_TOKEN}"; fi; \
+    if [ "${MIRROR_SKIP_CERT_CHECK}" = "1" ]; then npm config set strict-ssl false; fi; \
     if [ -n "${CA_BUNDLE_B64}" ]; then printf '%s' "${CA_BUNDLE_B64}" | base64 -d > /tmp/site-ca.pem; npm config set cafile /tmp/site-ca.pem; export NODE_EXTRA_CA_CERTS=/tmp/site-ca.pem; fi; \
     npm ci --omit=dev --no-audit --no-fund; \
     node scripts/check-release-age.js --offline; \

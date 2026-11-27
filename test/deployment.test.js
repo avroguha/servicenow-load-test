@@ -158,3 +158,16 @@ test('with a site mirror the build uses only it: the security-updates source is 
   assert.ok(step.trim().endsWith('fi; \\'), 'both happen only when a mirror is named');
   for (const f of ['Dockerfile', 'docker-compose.yml', 'docker-compose.worker.yml', 'work.env', 'home.env', 'README.md']) assert.ok(!/APT_SECURITY_MIRROR/.test(read(f)), `${f} still names a security mirror`);
 });
+
+test('the mirrors\' certificate check can be switched off for the build, and only for the build', () => {
+  assert.match(dockerfile, /^ARG MIRROR_SKIP_CERT_CHECK=$/m, 'off unless the env file says so');
+  const apt = dockerfile.slice(dockerfile.indexOf('RUN set -eu'), dockerfile.indexOf('chromium --version'));
+  assert.match(apt, /if \[ "\$\{MIRROR_SKIP_CERT_CHECK\}" = "1" \]; then \\\n\s+printf [^\n]*Verify-Peer "false"[^\n]*Verify-Host "false"[^\n]*> \/etc\/apt\/apt\.conf\.d\/99-mirror-no-cert-check/);
+  assert.ok(apt.indexOf('99-mirror-no-cert-check;') < apt.indexOf('apt-get update'), 'set before the first download');
+  assert.match(apt, /rm -rf [^\n]*\/etc\/apt\/apt\.conf\.d\/99-mirror-no-cert-check/, 'and removed in the same step, so the image does not keep it');
+  assert.match(dockerfile, /if \[ "\$\{MIRROR_SKIP_CERT_CHECK\}" = "1" \]; then npm config set strict-ssl false; fi/);
+  assert.ok(!/AllowUnauthenticated|allow-unauthenticated|trusted=yes/i.test(dockerfile), 'the packages\' own signatures are still checked');
+  for (const f of ['docker-compose.yml', 'docker-compose.worker.yml']) assert.match(read(f), /MIRROR_SKIP_CERT_CHECK: \$\{MIRROR_SKIP_CERT_CHECK\?/, `${f} must pass it into the build`);
+  assert.strictEqual(home.MIRROR_SKIP_CERT_CHECK, '', 'at home the public sources are checked');
+  assert.ok(['', '1'].includes(work.MIRROR_SKIP_CERT_CHECK));
+});

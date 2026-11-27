@@ -7,6 +7,7 @@
 // pass and a screenshot (UI) or the answer (API) for every step. Stop - asked
 // for, reached by the end of the plan, forced by a failure or by the two-hour
 // limit - always ends in cleanup of what the run created on the instance.
+const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -79,6 +80,8 @@ function normalize(sc) {
       // Who carries the load of a browser test: real browsers, lightweight users (the recorded requests), or
       // whichever fits - browsers while this machine can drive that many, lightweight users beyond.
       engine: type === 'api' ? 'browser' : ['browser', 'http'].includes(load.engine) ? load.engine : 'auto',
+      // Real browsers that go through the same steps during a lightweight run, to show what a person would see.
+      probes: type === 'api' ? 0 : Math.min(5, Math.max(0, Math.floor(n(load.probes, 2)))),
       pattern,
       // sustained and parallel
       users: Math.max(1, Math.floor(n(load.users, 5, 1))),
@@ -205,7 +208,14 @@ function answer(r) {
     `A step typically took ${secs(sum.p50)}; 95% took ${secs(sum.p95)} or less; the slowest ${secs(sum.max)}.`,
     `"Too slow" for this test means 95% of steps slower than ${secs(sc.limit.p95Ms)}, or more than ${sc.limit.errorPct}% failing.`,
   ];
-  if (r.engine === 'http') facts.push('These times are how long ServiceNow took to answer. The time a browser needs to draw the page comes on top; a Test run with one browser shows that.');
+  const seen = r.stages.filter((s) => s.browser && s.browser.n);
+  if (r.probe && seen.length) {
+    const first = seen[0]; const last = seen[seen.length - 1];
+    facts.push(seen.length > 1 && last !== first
+      ? `What a person would have seen, measured by ${r.probes} real browser${r.probes > 1 ? 's' : ''} during the run: a step took typically ${secs(first.browser.p50)} with ${first.users} people on, and ${secs(last.browser.p50)} with ${last.users} (95% within ${secs(last.browser.p95)}).${r.probe.errors ? ` ${r.probe.errors} of the browsers' ${r.probe.n} steps failed.` : ''}`
+      : `What a person would have seen, measured by ${r.probes} real browser${r.probes > 1 ? 's' : ''} during the run: a step took typically ${secs(last.browser.p50)}, and 95% within ${secs(last.browser.p95)}.${r.probe.errors ? ` ${r.probe.errors} of the browsers' ${r.probe.n} steps failed.` : ''}`);
+    facts.push('The other times are how long ServiceNow took to answer the lightweight users; a browser adds the time to draw the page, which the line above includes.');
+  } else if (r.engine === 'http') facts.push(r.probe && r.probe.n ? `The ${r.probes} real browser${r.probes > 1 ? 's' : ''} measuring alongside finished no step successfully (${r.probe.errors} failed), so there is no figure for what a person would have seen.` : 'These times are how long ServiceNow took to answer. The time a browser needs to draw the page comes on top; a Test run with one browser shows that.');
   const stopped = r.stopAskedByUser ? ' The run was stopped by hand before the plan was complete.' : '';
   const machine = r.limit && r.limit.generatorBusy ? ' The test machine itself was at full CPU at that point, so this may be the test machine and not ServiceNow: repeat with ' + (r.engine === 'http' ? 'a worker on a stronger machine, or more worker machines' : 'lightweight users, or more worker machines') + '.' : '';
   const q = l.mode === 'simple' ? l.question : l.pattern === 'sustained' ? 'sustain' : 'parallel';
@@ -257,7 +267,7 @@ class Controller {
       id: r.id, kind: r.kind, state: r.state, phase: r.phase, scenario: r.scenario, by: r.by, instance: r.instance, createdAt: r.createdAt, startedAt: r.startedAt, endedAt: r.endedAt,
       removeBy: r.createdAt + MAX_RUN_MS,
       checks: r.checks, error: r.error, log: r.log.slice(-200), users: r.users.length, target: r.target, active: r.active,
-      totals: r.totals, stages: r.stages.map(({ ms, ...s }) => s), steps: r.steps.map(({ ms, ...s }) => s), series: r.series,
+      totals: r.totals, stages: r.stages.map(({ ms, browserMs, ...s }) => s), probes: r.probes || 0, probe: r.probe ? { n: r.probe.n, errors: r.probe.errors, steps: r.probe.steps.map(({ ms, ...s }) => s) } : null, steps: r.steps.map(({ ms, ...s }) => s), series: r.series,
       speed: last && ['running', 'paused'].includes(r.state) ? { rate: last.rate, reqs: last.reqs, avg: last.avg, p95: last.p95, errors: last.errors } : null,
       limit: r.limit, shots: r.shots, trace: r.trace, advice: r.advice, cleanup: r.cleanup, ledger: r.ledger.length, idp: r.idpStats, elapsed: r.elapsed, planSeconds: r.planSeconds,
       verdict: r.verdict || '', generatorBusy: r.generatorBusy, engine: r.engine, answer: r.answer || null, activity: ['running', 'paused'].includes(r.state) ? this.activity() : [],
@@ -287,13 +297,16 @@ class Controller {
     if (errs.length) throw new Error(errs.join(' '));
     const sn = SN.fromSettings(settings, scenario.instance);
     const p = plan(scenario);
-    const count = kind === 'build' ? 1 : p.max;
+    const light = kind === 'build' ? 1 : p.max;
+    // Lightweight run: a few real browsers measure alongside, never more than this machine can drive.
+    const probes = kind !== 'build' && engineOf(scenario, lim) === 'http' ? Math.min(scenario.load.probes, lim.maxBrowsers) : 0;
+    const count = light + probes;
     const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 12);
     const r = {
       id: `${stamp}-${crypto.randomBytes(2).toString('hex')}`, kind, scenario, by, instance: sn.instance, state: 'checking', phase: 'Checking the instance',
       createdAt: Date.now(), startedAt: 0, endedAt: 0, checks: [], error: '', log: [], users: [], ledger: [], target: 0, active: 0,
       totals: { n: 0, errors: 0, serverErrors: 0, requests: 0 }, stages: [], steps: [], series: [], bucket: null, limit: null, shots: [], trace: [],
-      advice: [], cleanup: null, elapsed: 0, planSeconds: kind === 'build' ? 0 : p.seconds, plan: p, idpStats: null, engine: kind === 'build' ? (scenario.type === 'api' ? 'api' : 'ui') : engineOf(scenario, lim), recorded: [], answer: null, generatorBusy: false, stopAsked: false, finished: new Set(),
+      advice: [], cleanup: null, elapsed: 0, planSeconds: kind === 'build' ? 0 : p.seconds, plan: p, idpStats: null, engine: kind === 'build' ? (scenario.type === 'api' ? 'api' : 'ui') : engineOf(scenario, lim), recorded: [], answer: null, light, probes, probe: null, generatorBusy: false, stopAsked: false, finished: new Set(),
     };
     this.run = r; this.sn = sn; this.secret = null;
     this.persist(); this.notify();
@@ -306,6 +319,7 @@ class Controller {
     const api = sc.type === 'api';
     const http = r.engine === 'http';
     this.log(`${r.kind === 'build' ? 'Test run' : 'Load run'} "${sc.name}" against ${sn.base}${r.by ? `, started by ${r.by}` : ''}`);
+    if (r.probes) this.log(`${r.probes} real browser${r.probes > 1 ? 's go' : ' goes'} through the same steps during the whole run, to measure what a person would see. Their times are shown apart and do not count towards the limit.`);
     if (http) this.log('Running with lightweight users: each sends the requests a browser made in the last test run, with its own session. No browser is opened.');
     const pre = await prov.preflight(sn, sc, count);
     r.checks = pre.checks;
@@ -336,7 +350,7 @@ class Controller {
     this.assign(r);
     const parallel = r.kind !== 'build' && sc.load.pattern === 'parallel';
     r.config = {
-      type: http ? 'http' : sc.type, origin: sn.base, recording: http ? recordingOf(sc) : null, record: r.kind === 'build' && !api, proxy: resolveProxy(settings, sc.proxy === '(connection)' ? (sn.instance.proxy || 'direct') : sc.proxy), authMode: sc.authMode, ssoId: made.sso ? made.sso.id : '', idpBaseUrl,
+      type: http ? 'http' : sc.type, probes: r.probes, origin: sn.base, recording: http ? recordingOf(sc) : null, record: r.kind === 'build' && !api, proxy: resolveProxy(settings, sc.proxy === '(connection)' ? (sn.instance.proxy || 'direct') : sc.proxy), authMode: sc.authMode, ssoId: made.sso ? made.sso.id : '', idpBaseUrl,
       oauth: made.oauth ? { clientId: made.oauth.clientId, clientSecret: made.oauth.clientSecret } : null,
       steps: sc.steps, thinkMs: r.kind === 'build' ? 500 : sc.load.thinkMs,
       sessionMode: sc.load.sessionMode, entry: sc.authMode === 'sso' ? sc.load.entry : 'home',
@@ -354,6 +368,8 @@ class Controller {
     r.steps = [first,
       ...sc.steps.map((s, i) => ({ index: i, name: (s.name || `${api ? s.method : s.type} ${s.url || s.selector}`.trim()) + (byLink && i === 0 ? ' (arriving: includes the SSO sign-in)' : ''), skip: s.type === 'wait' }))]
       .filter((s) => !s.skip).map(({ skip, ...s }) => ({ ...s, n: 0, errors: 0, ms: [], avg: 0, p50: 0, p95: 0, max: 0 }));
+    // The measuring browsers' own results, step by step.
+    if (r.probes) r.probe = { n: 0, errors: 0, steps: r.steps.map((s) => ({ index: s.index, name: s.name, n: 0, errors: 0, ms: [], avg: 0, p50: 0, p95: 0, max: 0, lastError: '' })) };
     r.state = 'running'; r.startedAt = Date.now(); r.lastTick = Date.now();
     r.phase = r.kind === 'build' ? 'Going through the steps once' : { ramp: 'Load is running: adding users step by step', sustained: 'Load is running: steady number of users', parallel: 'All users are being released at the same moment' }[sc.load.pattern];
     this.log(r.phase); this.persist();
@@ -371,22 +387,43 @@ class Controller {
     if (r.kind === 'build') spawnN = alive().length ? 0 : 1;
     else if (l.localWorkers === 'auto') spawnN = Math.max(0, Math.ceil((count - capacity()) / per));
     else spawnN = Math.max(0, Math.floor(Number(l.localWorkers) || 0));
-    for (let i = 0; i < spawnN; i += 1) {
-      const name = `local-${i + 1}`;
+    const startOne = (name) => {
+      // What the worker writes as it fails goes to a file: written through a pipe, the last words of a process that
+      // dies abruptly are lost, and they are the ones that matter.
+      const logFile = path.join(store.DATA, 'runs', r.id, `worker-${name}.log`);
+      fs.mkdirSync(path.dirname(logFile), { recursive: true });
+      const fd = fs.openSync(logFile, 'a');
       const proc = spawn(process.execPath, [path.join(__dirname, 'worker.js')], {
         env: { ...process.env, UILOAD_CONTROLLER: `http://127.0.0.1:${this.port}`, UILOAD_WORKER_TOKEN: settings.workerToken, UILOAD_WORKER_NAME: name, UILOAD_WORKER_CAPACITY: String(per), UILOAD_WORKER_LOCAL: '1', UILOAD_WORKER_API: api ? '1' : '' },
-        stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true,
+        stdio: ['ignore', 'ignore', fd], windowsHide: true,
       });
-      // A worker that dies, or complains, must not do so unheard.
-      let said = 0;
-      proc.stderr.on('data', (d) => { if (said < 20 && this.run === r) { said += 1; this.log(`[${name}] ${String(d).trim().split('\n')[0].slice(0, 300)}`); } });
+      fs.closeSync(fd);
+      // A worker that dies, or complains, must not do so unheard: its file is read as it grows.
+      let at = 0; let said = 0;
+      const tell = () => {
+        let text = '';
+        try { const all = fs.readFileSync(logFile, 'utf8'); text = all.slice(at); at = all.length; } catch { return; }
+        for (const line of text.split(/\r?\n/).map((x) => x.trim()).filter(Boolean)) if (said < 30 && this.run === r && !/^\(Use `node --trace-warnings|TimeoutNegativeWarning|^Timeout duration was set to/.test(line)) { said += 1; this.log(`[${name}] ${line.slice(0, 300)}`); }
+      };
+      const watch = setInterval(tell, 3000); watch.unref();
       proc.on('exit', (code) => {
+        clearInterval(watch); tell();
         if (this.run !== r || r.finishing || ['done', 'failed'].includes(r.state)) return;
         this.log(`[${name}] the worker process ended unexpectedly (exit code ${code}).`);
-        if (r.kind === 'build' || this.children.every((c) => c.exitCode !== null)) this.fail(new Error(`The worker process ${name} ended unexpectedly (exit code ${code}); see the log.`)).catch(() => {});
+        // A load run does not end because one worker process died: it is started again, takes the same users back,
+        // and they sign in again. Three times; a worker that keeps dying is a fault to look at, not to hide.
+        r.restarts = (r.restarts || 0) + 1;
+        if (r.kind !== 'build' && r.restarts <= 3 && !r.stopAsked) {
+          this.log(`Starting ${name} again (${r.restarts} of 3). Its users sign in again; what they were doing at that moment is lost, and this stretch of the run is less reliable.`);
+          this.children = this.children.filter((c) => c !== proc);
+          startOne(name);
+          return;
+        }
+        if (r.kind === 'build' || this.children.every((c) => c.exitCode !== null)) this.fail(new Error(`The worker process ${name} ended unexpectedly (exit code ${code})${r.restarts > 3 ? ', also after being started again 3 times' : ''}; see the log.`)).catch(() => {});
       });
       this.children.push(proc);
-    }
+    };
+    for (let i = 0; i < spawnN; i += 1) startOne(`local-${i + 1}`);
     if (spawnN) this.log(`Started ${spawnN} local worker${spawnN > 1 ? 's' : ''} (${per} users each)`);
     const until = Date.now() + 30000;
     while (Date.now() < until && capacity() < count && !r.stopAsked) await new Promise((s) => setTimeout(s, 300));
@@ -402,8 +439,10 @@ class Controller {
     const cap = r.capOf || ((w) => w.capacity);
     const ws = [...this.workers.values()].filter((w) => Date.now() - w.lastSeen < 6000).map((w) => ({ w, n: 0, c: cap(w) }));
     r.assignment = new Map();
+    const light = r.light == null ? r.users.length : r.light;
+    const home = ws.find((x) => x.w.local) || ws[0];
     r.users.forEach((u, i) => {
-      const free = ws.filter((x) => x.n < x.c).sort((a, b) => a.n / a.c - b.n / b.c)[0];
+      const free = i >= light ? home : ws.filter((x) => x.n < x.c).sort((a, b) => a.n / a.c - b.n / b.c)[0];
       if (!free) return;
       free.n += 1;
       if (!r.assignment.has(free.w.name)) r.assignment.set(free.w.name, []);
@@ -432,7 +471,7 @@ class Controller {
       if (r.elapsed > most) { r.error = r.error || `The test did not finish within ${Math.round(most / 60)} minutes.`; await this.finish('The test run was given up'); return; }
     } else if (r.state === 'running') {
       const stageNo = Math.floor(r.elapsed / p.stepSeconds);
-      const users = Math.min(p.max, p.start + stageNo * p.step, r.users.length);
+      const users = Math.min(p.max, p.start + stageNo * p.step, r.light == null ? r.users.length : Math.min(r.light, r.users.length));
       let st = r.stages[r.stages.length - 1];
       if (!st || st.users !== users) {
         if (st) this.closeStage(r, st);
@@ -445,7 +484,7 @@ class Controller {
       if (p.passes) {
         // Parallel: over when every user has done its passes.
         const longest = p.passes * (r.steps.length + 1) * (r.scenario.load.timeoutSeconds + r.scenario.load.thinkSeconds) + 120;
-        if (r.finished.size >= r.users.length) { this.closeStage(r, st, false); await this.finish('Every user finished'); return; }
+        if ([...r.finished].filter((id) => id < (r.light == null ? Infinity : r.light)).length >= Math.min(r.users.length, r.light == null ? Infinity : r.light)) { this.closeStage(r, st, false); await this.finish('Every user finished'); return; }
         if (r.elapsed > longest) { this.closeStage(r, st, false); await this.finish('Some users did not finish in time'); return; }
       } else if (r.elapsed >= r.planSeconds) { this.closeStage(r, st, false); await this.finish('The plan is complete'); return; }
     }
@@ -464,19 +503,21 @@ class Controller {
   }
 
   rollBucket(r, now) {
-    if (!r.bucket) r.bucket = { t: now, ms: [], errors: 0, reqs: 0 };
+    if (!r.bucket) r.bucket = { t: now, ms: [], errors: 0, reqs: 0, browserMs: [], browserErrors: 0 };
     if (now - r.bucket.t < BUCKET_MS) return;
     const s = summary(r.bucket.ms);
     const secs = (now - r.bucket.t) / 1000;
-    r.series.push({ t: Math.round(r.elapsed), users: r.active, n: s.n, errors: r.bucket.errors, avg: s.avg, p95: s.p95, rate: Math.round((s.n / secs) * 60), reqs: Math.round((r.bucket.reqs / secs) * 10) / 10 });
+    const bs = r.probes && r.bucket.browserMs.length ? summary(r.bucket.browserMs) : null;
+    r.series.push({ ...(r.probes ? { browser: bs ? bs.p50 : 0, browserN: bs ? bs.n : 0, browserErrors: r.bucket.browserErrors } : {}), t: Math.round(r.elapsed), users: Math.max(0, r.active - (r.probes || 0)), n: s.n, errors: r.bucket.errors, avg: s.avg, p95: s.p95, rate: Math.round((s.n / secs) * 60), reqs: Math.round((r.bucket.reqs / secs) * 10) / 10 });
     if (r.series.length > 2000) r.series.shift();
-    r.bucket = { t: now, ms: [], errors: 0, reqs: 0 };
+    r.bucket = { t: now, ms: [], errors: 0, reqs: 0, browserMs: [], browserErrors: 0 };
   }
 
   closeStage(r, st, act = true) {
     if (st.closed) return;
     st.closed = true; st.to = r.elapsed;
     Object.assign(st, summary(st.ms));
+    if (st.browserMs && st.browserMs.length) { const b = summary(st.browserMs); st.browser = { n: b.n, p50: b.p50, p95: b.p95 }; }
     const lim = r.scenario.limit;
     const errPct = st.n ? (100 * st.errors) / st.n : 0;
     st.errorPct = Math.round(errPct * 10) / 10;
@@ -515,15 +556,33 @@ class Controller {
     }
     if (r) r.active = [...this.workers.values()].filter((x) => Date.now() - x.lastSeen < 6000).reduce((a, x) => a + x.active, 0);
     if (!r || !['running', 'paused'].includes(r.state) || !r.assignment) return { state: r && r.state === 'stopping' ? 'stopped' : 'idle' };
-    const mine = (r.assignment.get(name) || []).filter((i) => i < r.target);
+    // The measuring browsers (the users after the lightweight ones) run from the start to the end, whatever the level.
+    const light = r.light == null ? Infinity : r.light;
+    const mine = (r.assignment.get(name) || []).filter((i) => i < r.target || (i >= light && i < r.users.length));
     return {
       runId: r.id, state: r.state, config: r.config,
-      vus: mine.map((i) => ({ id: i, user: r.users[i].name, userId: r.users[i].id, password: this.secret.password || undefined, ticket: this.secret.sso ? idp.ticket(r.users[i].name) : undefined })),
+      vus: mine.map((i) => ({ id: i, kind: i >= light ? 'browser' : undefined, user: r.users[i].name, userId: r.users[i].id, password: this.secret.password || undefined, ticket: this.secret.sso ? idp.ticket(r.users[i].name) : undefined })),
     };
   }
 
   sample(r, s) {
     const ms = Number(s.ms) || 0;
+    if (r.probe && r.light != null && Number(s.vu) >= r.light) {
+      // What a person would see: timed in a real browser while the lightweight users make the load.
+      const p = r.probe;
+      p.n += 1; if (!s.ok) p.errors += 1;
+      const row = p.steps.find((x) => x.index === s.step);
+      if (row) { row.n += 1; if (!s.ok) { row.errors += 1; row.lastError = s.error; } else row.ms.push(ms); if (row.n < 20 || row.n % 5 === 0) Object.assign(row, summary(row.ms)); }
+      // A first arrival of a browser that then stays signed in is not what a page takes under load.
+      const once = s.arrival && r.config && r.config.sessionMode === 'keep';
+      if (s.ok && !once) {
+        const st = r.stages[r.stages.length - 1];
+        if (st && !st.closed) (st.browserMs = st.browserMs || []).push(ms);
+        if (r.bucket) r.bucket.browserMs.push(ms);
+      }
+      if (!s.ok && r.bucket) r.bucket.browserErrors += 1;
+      return;
+    }
     r.totals.n += 1; r.totals.serverErrors += Number(s.serverErrors) || 0; r.totals.requests += Number(s.requests) || 0;
     if (!s.ok) r.totals.errors += 1;
     const step = r.steps.find((x) => x.index === s.step);
@@ -586,6 +645,7 @@ class Controller {
     const last = r.stages[r.stages.length - 1];
     if (last && !last.closed) this.closeStage(r, last, false);
     for (const s of r.steps) Object.assign(s, summary(s.ms));
+    if (r.probe) for (const s of r.probe.steps) Object.assign(s, summary(s.ms));
     r.state = 'stopping'; r.phase = `${why} - closing ${r.scenario.type === 'api' ? 'connections' : 'browsers'}`; r.target = 0; this.notify();
     const until = Date.now() + 15000;
     while (Date.now() < until && [...this.workers.values()].some((w) => Date.now() - w.lastSeen < 4000 && w.active > 0)) await new Promise((s) => setTimeout(s, 300));
@@ -622,6 +682,7 @@ class Controller {
     }
     else if (r.kind === 'build' && r.verdict === 'passed' && r.scenario.type !== 'api' && r.scenario.id) this.log('Nothing was recorded for lightweight users: the worker that ran this test did not send a recording. A worker on another machine may be running an older version of the app - update it (Capacity and workers lists the workers).');
     if (!failed) r.answer = answer(r);
+    if (r.answer && r.restarts) r.answer.facts.push(`A worker process of this app ended unexpectedly and was started again ${r.restarts} time${r.restarts > 1 ? 's' : ''} during the run. The users on it signed in again; the figures around those moments are less reliable.`);
     r.state = failed ? 'failed' : 'done';
     const outcome = r.kind === 'build' ? (r.verdict === 'passed' ? `The test PASSED: ${t.n} step${t.n === 1 ? '' : 's'}, none failed` : 'The test FAILED') : why;
     r.phase = r.cleanup.complete ? `${outcome}. Everything created for the run has been removed.` : `${outcome}. CLEANUP IS NOT COMPLETE - it will be tried again automatically.`;

@@ -88,8 +88,43 @@ function saveSettings(patch) {
   return s;
 }
 
-function scenarios() { return read('scenarios.json', []); }
-function saveScenarios(list) { write('scenarios.json', list); }
+// Tests. A deleted test is kept in the recycle bin (the same file, marked with the day it was deleted) for
+// BIN_DAYS, can be put back until then, and is removed for good afterwards - with what was recorded for it.
+const BIN_DAYS = 180;
+function allScenarios() { return read('scenarios.json', []); }
+function scenarios() { return allScenarios().filter((x) => !x.deletedAt); }
+function binned() { return allScenarios().filter((x) => x.deletedAt).sort((a, b) => b.deletedAt - a.deletedAt); }
+// Saves the tests in use; what is in the recycle bin stays as it is.
+function saveScenarios(list) { const ids = new Set(list.map((x) => x.id)); write('scenarios.json', [...list, ...binned().filter((x) => !ids.has(x.id))]); }
+function binScenario(id, by, now = Date.now()) {
+  const all = allScenarios(); const sc = all.find((x) => x.id === id && !x.deletedAt);
+  if (!sc) return null;
+  sc.deletedAt = now; sc.deletedBy = by || '';
+  write('scenarios.json', all);
+  return sc;
+}
+function restoreScenario(id) {
+  const all = allScenarios(); const sc = all.find((x) => x.id === id && x.deletedAt);
+  if (!sc) return null;
+  delete sc.deletedAt; delete sc.deletedBy;
+  // Another test may have taken its name meanwhile: two tests with one name cannot be told apart in the lists.
+  if (all.some((x) => x !== sc && !x.deletedAt && x.name === sc.name)) sc.name = `${sc.name} (restored)`;
+  write('scenarios.json', all);
+  return sc;
+}
+// Only from the recycle bin: a test in use is never removed for good in one step.
+function purgeScenario(id) {
+  const all = allScenarios(); const sc = all.find((x) => x.id === id && x.deletedAt);
+  if (!sc) return false;
+  write('scenarios.json', all.filter((x) => x !== sc));
+  fs.rmSync(file(`recording-${path.basename(String(id))}.json`), { force: true });
+  return true;
+}
+function purgeOldScenarios(now = Date.now()) {
+  const old = binned().filter((x) => now - x.deletedAt >= BIN_DAYS * 86400000);
+  for (const x of old) purgeScenario(x.id);
+  return old.map((x) => x.name);
+}
 
 function runDir(id) { return path.join(DATA, 'runs', id); }
 function saveRun(id, value) { write(path.join('runs', id, 'run.json'), value); }
@@ -109,5 +144,6 @@ function deleteRun(id) { fs.rmSync(runDir(path.basename(id)), { recursive: true,
 
 module.exports = {
   DATA, read, write, settings, saveSettings, instance, scenarios, saveScenarios,
+  BIN_DAYS, binned, binScenario, restoreScenario, purgeScenario, purgeOldScenarios,
   saveRun, readRun, listRuns, saveShot, shotPath, deleteRun,
 };
